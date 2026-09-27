@@ -99,7 +99,7 @@ This is the first vertical slice. ArtIC is the only museum adapter. Crop safety 
 
 ## Development
 
-The tests are end-to-end scenarios that drive the CLI and the gallery server in a temporary home. Fake `dms` and `systemctl` commands and a local fake model server stand in for the desktop and Ollama, so no network, model, or graphical session is needed:
+The tests are end-to-end scenarios that drive the CLI and the gallery server in a temporary home. Hypothesis generates settings cases for the gallery API. Fake `dms` and `systemctl` commands and a local fake model server stand in for the desktop and Ollama, so no network, model, or graphical session is needed. Install the test extra (`python -m pip install -e '.[test]'`) before running:
 
 ```bash
 bash scripts/check

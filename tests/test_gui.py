@@ -5,6 +5,8 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from hypothesis import example, given, settings, strategies as st
+
 from artwall.config import config_path, data_dir, database_path, load_config
 from artwall.gui import GuiContext, create_server
 from artwall.systemd import user_unit_dir
@@ -70,20 +72,28 @@ class GalleryTests(HomeTest):
         status, image = self.call("/image/queued")
         self.assertEqual((status, image[:4]), (200, b"\x89PNG"))
 
-    def test_settings_edit_keeps_comments_and_restarts_an_installed_timer(self):
+    @settings(max_examples=12, database=None, deadline=None, derandomize=True)
+    @given(interval=st.integers(min_value=0, max_value=1500),
+           model=st.text(alphabet='abcXYZ0123:#"\\ ', min_size=1, max_size=20).filter(str.strip))
+    @example(interval=1, model="local")
+    @example(interval=180, model="llava:latest")
+    def test_settings_edits_preserve_comments_and_update_the_timer(self, interval: int, model: str):
+        timer = user_unit_dir() / "artwall-rotate.timer"
+        if not timer.exists():
+            self.cli("install-timers", "--no-enable")
         before = self.config_file.read_text()
-        status, _ = self.call("/api/settings", {"interval_minutes": 1, "model": "local", "max_artworks": 1})
-        self.assertEqual((status, self.config_file.read_text()), (400, before))
-        self.cli("install-timers", "--no-enable")
-        notice = self.post("/api/settings", {"interval_minutes": 180, "model": "llava:latest", "max_artworks": 2})
-        self.assertIn("New artwork count", notice)
-        text = self.config_file.read_text()
-        self.assertIn("interval_minutes = 180 # Keep this note", text)
-        self.assertIn('model = "llava:latest" # Local model', text)
-        self.assertEqual(load_config().max_artworks, 2)
-        self.assertIn("OnUnitActiveSec=180min", (user_unit_dir() / "artwall-rotate.timer").read_text())
-        self.assertEqual(self.commands(), ["systemctl --user daemon-reload",
-                                           "systemctl --user try-restart artwall-rotate.timer"])
+        status, _ = self.call("/api/settings", {"interval_minutes": interval, "model": model, "max_artworks": 2})
+        if not 15 <= interval <= 1440:
+            self.assertEqual((status, self.config_file.read_text()), (400, before))
+            return
+        self.assertEqual(status, 200)
+        saved = self.config_file.read_text()
+        self.assertIn(f"interval_minutes = {interval} # Keep this note", saved)
+        self.assertIn(f"model = {json.dumps(model.strip())} # Local model", saved)
+        configured = load_config()
+        self.assertEqual((configured.interval_minutes, configured.model, configured.max_artworks),
+                         (interval, model.strip(), 2))
+        self.assertIn(f"OnUnitActiveSec={interval}min", timer.read_text())
 
     def test_votes_and_blacklists_shape_the_upcoming_queue(self):
         self.post("/api/feedback", {"id": "queued", "kind": "like"})

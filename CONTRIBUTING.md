@@ -11,12 +11,12 @@ From the repository root:
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -e .
+python -m pip install -e '.[test]'
 bash scripts/check
 ```
 
-The check script compiles the package and runs the offline test suite. It is
-also the command used by CI. For a focused test, run
+The check script compiles the package and runs the offline test suite, including
+Hypothesis-generated gallery settings cases. CI runs the same command. For a focused test, run
 `python -m unittest tests/test_gui.py -v` (substitute the relevant file).
 
 ## Find the right place to change
