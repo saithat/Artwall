@@ -66,7 +66,9 @@ After the first wallpaper works in the Niri session:
 artwall install-timers
 ```
 
-This writes four `systemd --user` units under `~/.config/systemd/user/` and enables the rotation and daily curation timers. Rotation shows an already rendered image every two hours by default. Daily curation refreshes ArtIC metadata and renders the next queue. The interface updates an installed rotation timer when you change the interval. If you edit `[rotation].interval_minutes` by hand, run `artwall install-timers` again. `artwall install-timers --no-enable` writes the units without enabling them.
+This writes five `systemd --user` units under `~/.config/systemd/user/` and enables a login service plus the rotation and daily curation timers. The login service advances one cached wallpaper when the graphical session starts. Rotation then shows another every two hours by default. Daily curation refreshes ArtIC metadata and renders the next queue. The interface updates an installed rotation timer when you change the interval. If you edit `[rotation].interval_minutes` by hand, run `artwall install-timers` again. `artwall install-timers --no-enable` writes the units without enabling them.
+
+The rotation timer starts with the graphical session and does not catch up missed intervals while the computer is off. At login, Artwall advances once; each later timer run also advances once. A failed desktop update leaves that work queued for the next attempt. The login service retries briefly if the wallpaper backend is still starting.
 
 ## Configuration
 
@@ -99,7 +101,7 @@ This is the first vertical slice. ArtIC is the only museum adapter. Crop safety 
 
 ## Development
 
-The default tests are end-to-end scenarios that drive the CLI and gallery server in a temporary home. Hypothesis generates settings cases for the gallery API. Fake `dms` and `systemctl` commands stand in for the desktop; the default check needs no network, model, or graphical session. Install the test extra (`python -m pip install -e '.[test]'`) before running:
+The default tests are end-to-end scenarios that drive the CLI and gallery server in a temporary home. They cover rights and lock-screen filtering, blacklists, dislike navigation, and a failed wallpaper update followed by a later login. Hypothesis generates settings cases for the gallery API. Fake `dms` and `systemctl` commands stand in for the desktop; the default check needs no network, model, or graphical session. Install the test extra (`python -m pip install -e '.[test]'`) before running:
 
 ```bash
 bash scripts/check

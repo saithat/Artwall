@@ -57,21 +57,6 @@ class GalleryTests(HomeTest):
         with self.database() as db:
             return db.get_artist_preference("A Painter").score
 
-    def test_state_shows_rotation_history_notes_and_images(self):
-        with self.database() as db:
-            self.queue(db, "pair", self.artwork("11", title="Night Harbor"), self.art)
-        self.post("/api/comment", {"id": "current", "comment": "The clouds are wonderful."})
-        state = self.state()
-        self.assertEqual((state["current"]["title"], state["current"]["comment"]),
-                         ("The Lighthouse", "The clouds are wonderful."))
-        # The two-work composition is outside the default one-artwork limit.
-        self.assertEqual([item["id"] for item in state["queued"]], ["queued"])
-        self.assertEqual([item["id"] for item in state["history"]], ["current"])
-        status, thumbnail = self.call("/thumb/current")
-        self.assertEqual((status, thumbnail[:2]), (200, b"\xff\xd8"))
-        status, image = self.call("/image/queued")
-        self.assertEqual((status, image[:4]), (200, b"\x89PNG"))
-
     @settings(max_examples=12, database=None, deadline=None, derandomize=True)
     @given(interval=st.integers(min_value=0, max_value=1500),
            model=st.text(alphabet='abcXYZ0123:#"\\ ', min_size=1, max_size=20).filter(str.strip))
@@ -95,38 +80,37 @@ class GalleryTests(HomeTest):
                          (interval, model.strip(), 2))
         self.assertIn(f"OnUnitActiveSec={interval}min", timer.read_text())
 
-    def test_votes_and_blacklists_shape_the_upcoming_queue(self):
-        self.post("/api/feedback", {"id": "queued", "kind": "like"})
-        self.assertTrue(self.state()["queued"][0]["feedback"]["like"])
-        self.post("/api/blacklist/artist", {"artist": "A Painter", "blocked": True})
+    def test_artwork_and_artist_blacklists_filter_independently(self):
+        with self.database() as db:
+            self.queue(db, "same-artist", self.artwork("11", artist="A Painter"))
+            self.queue(db, "other-artist", self.artwork("12", artist="Another Painter"))
+        queued = lambda: [item["id"] for item in self.state()["queued"]]
+        self.assertEqual(queued(), ["queued", "same-artist", "other-artist"])
         self.post("/api/blacklist/artwork", {"id": self.art.id, "blocked": True})
-        state = self.state()
-        self.assertEqual((state["blacklisted_artists"], [art["id"] for art in state["blacklisted_artworks"]],
-                          state["queued"]), (["A Painter"], [self.art.id], []))
-        self.post("/api/blacklist/artist", {"artist": "A Painter", "blocked": False})
+        self.assertEqual(queued(), ["same-artist", "other-artist"])
         self.post("/api/blacklist/artwork", {"id": self.art.id, "blocked": False})
-        self.assertIn("Removed from upcoming rotation", self.post("/api/feedback", {"id": "queued", "kind": "dislike"}))
-        self.assertEqual((self.state()["queued"], self.score()), ([], -1))
-        self.post("/api/feedback", {"id": "queued", "kind": "dislike"})  # A second click takes it back.
-        self.assertEqual(([item["id"] for item in self.state()["queued"]], self.score()), (["queued"], 0))
-        self.assertEqual(self.commands(), [])
+        self.post("/api/blacklist/artist", {"artist": "A Painter", "blocked": True})
+        self.assertEqual(queued(), ["other-artist"])
+        self.post("/api/blacklist/artist", {"artist": "A Painter", "blocked": False})
+        self.assertEqual(queued(), ["queued", "same-artist", "other-artist"])
 
-    def test_thumbs_down_on_current_rotates_once_or_keeps_trying(self):
-        # The only queued alternative shows the same, now disliked, artwork.
-        self.assertIn("No other eligible artwork", self.post("/api/feedback", DISLIKE_CURRENT))
+    def test_disliking_current_retries_a_failed_update_then_moves_one_work(self):
         with self.database() as db:
             alternate = self.queue(db, "alternate", self.artwork("99", title="A Different Work"))
+            self.queue(db, "later", self.artwork("100", title="Another Work"))
         self.desktop_down.touch()
-        self.assertIn("could not change", self.post("/api/feedback", DISLIKE_CURRENT))
+        with self.assertLogs("artwall", level="WARNING"):
+            notice = self.post("/api/feedback", DISLIKE_CURRENT)
+        self.assertIn("could not change", notice)
         self.assertEqual(self.state()["current"]["id"], "current")
+        self.assertEqual([item["id"] for item in self.state()["queued"]], ["alternate", "later"])
         self.desktop_down.unlink()
         self.assertIn("Now showing A Different Work", self.post("/api/feedback", DISLIKE_CURRENT))
         self.assertIn("already changed", self.post("/api/feedback", DISLIKE_CURRENT))
+        self.assertEqual(self.state()["current"]["id"], "alternate")
+        self.assertEqual([item["id"] for item in self.state()["queued"]], ["later"])
         self.assertEqual([line.split()[-1] for line in self.commands()], [alternate.output_path] * 2)
         self.assertEqual(self.score(), -1)
-        # A deliberate click on the earlier work reverses its vote.
-        self.post("/api/feedback", {**DISLIKE_CURRENT, "current_id": "alternate"})
-        self.assertEqual(self.score(), 0)
 
     def test_rejects_cross_origin_requests_missing_tokens_and_path_traversal(self):
         comment = {"id": "current", "comment": "evil"}

@@ -19,6 +19,22 @@ def unit_contents(settings: Settings, executable: str) -> dict[str, str]:
     if " " in executable:
         raise ValueError("Systemd executable path may not contain spaces")
     return {
+        "artwall-login.service": f"""[Unit]
+Description=Advance Artwall once when the graphical session starts
+PartOf=graphical-session.target
+After=graphical-session.target
+StartLimitIntervalSec=2min
+StartLimitBurst=12
+
+[Service]
+Type=oneshot
+ExecStart={executable} next
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=graphical-session.target
+""",
         "artwall-rotate.service": f"""[Unit]
 Description=Rotate to the next cached museum wallpaper
 After=graphical-session.target
@@ -29,15 +45,16 @@ ExecStart={executable} next
 """,
         "artwall-rotate.timer": f"""[Unit]
 Description=Rotate museum wallpaper every {settings.interval_minutes} minutes
+PartOf=graphical-session.target
+After=graphical-session.target
 
 [Timer]
 OnActiveSec={settings.interval_minutes}min
 OnUnitActiveSec={settings.interval_minutes}min
-Persistent=true
 Unit=artwall-rotate.service
 
 [Install]
-WantedBy=timers.target
+WantedBy=graphical-session.target
 """,
         "artwall-curate.service": f"""[Unit]
 Description=Refresh museum catalog and prepare offline wallpapers

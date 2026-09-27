@@ -321,9 +321,13 @@ def cmd_install_timers(args: argparse.Namespace, settings: Settings) -> None:
         print(path)
     if not args.no_enable:
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-        subprocess.run(["systemctl", "--user", "enable", "--now",
-                        "artwall-curate.timer", "artwall-rotate.timer"], check=True)
-        print("User timers enabled.")
+        # Reenable removes the old timers.target link when upgrading to the
+        # graphical-session timer, so a lingering user manager cannot rotate early.
+        subprocess.run(["systemctl", "--user", "reenable", "artwall-rotate.timer"], check=True)
+        subprocess.run(["systemctl", "--user", "enable", "--now", "artwall-curate.timer"], check=True)
+        subprocess.run(["systemctl", "--user", "restart", "artwall-rotate.timer"], check=True)
+        subprocess.run(["systemctl", "--user", "enable", "artwall-login.service"], check=True)
+        print("User timers and login rotation enabled.")
 
 
 def cmd_gui(args: argparse.Namespace, settings: Settings) -> None:

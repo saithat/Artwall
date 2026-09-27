@@ -74,7 +74,8 @@ def eligible(db: Database, settings: Settings, compositions: Iterable[Compositio
                 or not _valid_image(composition, settings)):
             continue
         works = [db.get_artwork(artwork_id) for artwork_id in ids]
-        if all(work is not None and exclusions.allows(work) for work in works):
+        if all(work is not None and work.public_domain and work.open_access
+               and exclusions.allows(work) for work in works):
             yield composition
 
 
