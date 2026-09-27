@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "artwall"
+version = "0.1.0"
+description = "A local museum curator for Niri and other Wayland desktops"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = ["Pillow>=11.0"]
+
+[project.scripts]
+artwall = "artwall.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["artwall"]

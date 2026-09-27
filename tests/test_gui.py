@@ -1,0 +1,127 @@
+"""End-to-end gallery scenarios over real loopback HTTP."""
+
+import json
+from typing import Any
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+from artwall.config import config_path, data_dir, database_path, load_config
+from artwall.gui import GuiContext, create_server
+from artwall.systemd import user_unit_dir
+from tests.support import HomeTest
+
+DISLIKE_CURRENT = {"id": "current", "kind": "dislike", "current_id": "current"}
+
+
+class GalleryTests(HomeTest):
+    config = ('[display]\nwidth = 860\nheight = 360\n[rotation]\ninterval_minutes = 120 # Keep this note\n'
+              '[llm]\nmodel = "qwen3.6:27b" # Local model\n')
+
+    def setUp(self):
+        super().setUp()
+        self.art = self.artwork("10", title="The Lighthouse", artist="A Painter", date_display="c. 1820")
+        with self.database() as db:
+            for identifier in ("current", "queued"):
+                self.queue(db, identifier, self.art, description="A lighthouse rises above the sea.")
+            db.mark_shown("current")
+        context = GuiContext(database_path(), data_dir(), config_path(), user_unit_dir())
+        self.base = self.serve(create_server(context, 0))
+        self.token = ""
+        self.token = self.state()["csrf_token"]
+
+    def call(self, path: str, payload: Any = None, headers: dict[str, str] | None = None) -> tuple[int, bytes]:
+        request = Request(self.base + path, headers={"X-Artwall-Token": self.token, **(headers or {})})
+        if payload is not None:
+            request.data = json.dumps(payload).encode()
+            request.add_header("Content-Type", "application/json")
+        try:
+            with urlopen(request, timeout=10) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            with error:
+                return error.code, error.read()
+
+    def state(self) -> dict[str, Any]:
+        status, body = self.call("/api/state")
+        self.assertEqual(status, 200)
+        return json.loads(body)
+
+    def post(self, path: str, payload: dict[str, Any]) -> str:
+        status, body = self.call(path, payload)
+        self.assertEqual(status, 200, body)
+        return json.loads(body)["notice"]
+
+    def score(self) -> int:
+        with self.database() as db:
+            return db.get_artist_preference("A Painter").score
+
+    def test_state_shows_rotation_history_notes_and_images(self):
+        with self.database() as db:
+            self.queue(db, "pair", self.artwork("11", title="Night Harbor"), self.art)
+        self.post("/api/comment", {"id": "current", "comment": "The clouds are wonderful."})
+        state = self.state()
+        self.assertEqual((state["current"]["title"], state["current"]["comment"]),
+                         ("The Lighthouse", "The clouds are wonderful."))
+        # The two-work composition is outside the default one-artwork limit.
+        self.assertEqual([item["id"] for item in state["queued"]], ["queued"])
+        self.assertEqual([item["id"] for item in state["history"]], ["current"])
+        status, thumbnail = self.call("/thumb/current")
+        self.assertEqual((status, thumbnail[:2]), (200, b"\xff\xd8"))
+        status, image = self.call("/image/queued")
+        self.assertEqual((status, image[:4]), (200, b"\x89PNG"))
+
+    def test_settings_edit_keeps_comments_and_restarts_an_installed_timer(self):
+        before = self.config_file.read_text()
+        status, _ = self.call("/api/settings", {"interval_minutes": 1, "model": "local", "max_artworks": 1})
+        self.assertEqual((status, self.config_file.read_text()), (400, before))
+        self.cli("install-timers", "--no-enable")
+        notice = self.post("/api/settings", {"interval_minutes": 180, "model": "llava:latest", "max_artworks": 2})
+        self.assertIn("New artwork count", notice)
+        text = self.config_file.read_text()
+        self.assertIn("interval_minutes = 180 # Keep this note", text)
+        self.assertIn('model = "llava:latest" # Local model', text)
+        self.assertEqual(load_config().max_artworks, 2)
+        self.assertIn("OnUnitActiveSec=180min", (user_unit_dir() / "artwall-rotate.timer").read_text())
+        self.assertEqual(self.commands(), ["systemctl --user daemon-reload",
+                                           "systemctl --user try-restart artwall-rotate.timer"])
+
+    def test_votes_and_blacklists_shape_the_upcoming_queue(self):
+        self.post("/api/feedback", {"id": "queued", "kind": "like"})
+        self.assertTrue(self.state()["queued"][0]["feedback"]["like"])
+        self.post("/api/blacklist/artist", {"artist": "A Painter", "blocked": True})
+        self.post("/api/blacklist/artwork", {"id": self.art.id, "blocked": True})
+        state = self.state()
+        self.assertEqual((state["blacklisted_artists"], [art["id"] for art in state["blacklisted_artworks"]],
+                          state["queued"]), (["A Painter"], [self.art.id], []))
+        self.post("/api/blacklist/artist", {"artist": "A Painter", "blocked": False})
+        self.post("/api/blacklist/artwork", {"id": self.art.id, "blocked": False})
+        self.assertIn("Removed from upcoming rotation", self.post("/api/feedback", {"id": "queued", "kind": "dislike"}))
+        self.assertEqual((self.state()["queued"], self.score()), ([], -1))
+        self.post("/api/feedback", {"id": "queued", "kind": "dislike"})  # A second click takes it back.
+        self.assertEqual(([item["id"] for item in self.state()["queued"]], self.score()), (["queued"], 0))
+        self.assertEqual(self.commands(), [])
+
+    def test_thumbs_down_on_current_rotates_once_or_keeps_trying(self):
+        # The only queued alternative shows the same, now disliked, artwork.
+        self.assertIn("No other eligible artwork", self.post("/api/feedback", DISLIKE_CURRENT))
+        with self.database() as db:
+            alternate = self.queue(db, "alternate", self.artwork("99", title="A Different Work"))
+        self.desktop_down.touch()
+        self.assertIn("could not change", self.post("/api/feedback", DISLIKE_CURRENT))
+        self.assertEqual(self.state()["current"]["id"], "current")
+        self.desktop_down.unlink()
+        self.assertIn("Now showing A Different Work", self.post("/api/feedback", DISLIKE_CURRENT))
+        self.assertIn("already changed", self.post("/api/feedback", DISLIKE_CURRENT))
+        self.assertEqual([line.split()[-1] for line in self.commands()], [alternate.output_path] * 2)
+        self.assertEqual(self.score(), -1)
+        # A deliberate click on the earlier work reverses its vote.
+        self.post("/api/feedback", {**DISLIKE_CURRENT, "current_id": "alternate"})
+        self.assertEqual(self.score(), 0)
+
+    def test_rejects_cross_origin_requests_missing_tokens_and_path_traversal(self):
+        comment = {"id": "current", "comment": "evil"}
+        self.assertEqual(self.call("/api/comment", comment, {"X-Artwall-Token": ""})[0], 403)
+        self.assertEqual(self.call("/api/comment", comment, {"Origin": "https://elsewhere.example"})[0], 403)
+        self.assertEqual(self.call("/image/not-a-composition")[0], 404)
+        self.assertEqual(self.call("/image/..%2F..%2Fetc%2Fpasswd")[0], 404)
+        self.assertEqual(self.state()["current"]["comment"], "")

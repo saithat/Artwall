@@ -1,0 +1,817 @@
+"""Local, source-grounded wallpaper curation.
+
+The museum provides facts; Ollama only chooses the composition and describes
+what is visible. Every model decision is checked again before rendering.
+"""
+
+from __future__ import annotations
+
+import base64
+from dataclasses import dataclass, replace
+from html import unescape
+from io import BytesIO
+import json
+import logging
+import math
+from pathlib import Path
+import re
+from typing import Any, Collection, Iterable, Mapping, Sequence
+from urllib import request
+
+from PIL import Image, ImageDraw, ImageOps
+
+from artwall.models import Artwork, CuratorDecision, DecisionArtwork, DecisionError, Layout
+
+
+LOG = logging.getLogger(__name__)
+
+SEED_ARTISTS = (
+    "caspar david friedrich", "j. m. w. turner", "john martin",
+    "ivan aivazovsky", "arnold böcklin", "odilon redon",
+    "gustave moreau", "franz von stuck", "gustave doré",
+    "albrecht dürer", "giovanni battista piranesi", "william blake",
+    "francisco goya", "katsushika hokusai", "utagawa hiroshige",
+    "hieronymus bosch", "pieter bruegel", "ernst haeckel",
+)
+SEED_THEMES = (
+    "romantic", "sublime", "symbolism", "ukiyo", "woodblock",
+    "engraving", "etching", "scientific", "natural history", "botanical",
+    "anatom", "astronom", "manuscript", "art nouveau", "renaissance",
+    "architectur", "mytholog", "ruin", "storm", "mountain", "ocean",
+    "night", "fog", "dream", "map", "print", "illustration",
+)
+_AWKWARD_TERMS = (
+    "nude", "naked", "erotic", "sexual", "genital", "execution", "massacre",
+    "decapitation", "corpse", "anatomical dissection", "crucifixion",
+)
+_NAME = re.compile(r"\b[^\W\d_][\w’'-]*\b")
+
+
+class DescriptionGroundingError(DecisionError):
+    """The model's caption asserts something unsupported by museum metadata."""
+
+
+def _clean_text(value: str | None, limit: int) -> str:
+    text = unescape(re.sub(r"<[^>]*>", " ", value or ""))
+    return " ".join(text.split())[:limit].strip()
+
+
+def _artist_key(artist: str | None) -> str:
+    return _clean_text(artist, 120).casefold()
+
+
+def _tags(work: Artwork) -> str:
+    return ", ".join(work.subject_tags or ())
+
+
+def _ratio(work: Artwork) -> float:
+    return work.aspect_ratio or 1.0
+
+
+def _fit(ratio: float, target: float) -> float:
+    """How closely one aspect ratio matches another, from 0 to 1."""
+    return min(ratio / target, target / ratio)
+
+
+def _single_layout(work: Artwork) -> Layout:
+    return "single" if _ratio(work) >= 1.85 else "near_single"
+
+
+def lock_screen_safe(artwork: Artwork) -> bool:
+    """Conservative metadata keyword check for a public lock screen."""
+    text = " ".join((artwork.title, _tags(artwork), artwork.museum_description or "", artwork.medium or ""))
+    return not any(term in text.casefold() for term in _AWKWARD_TERMS)
+
+
+@dataclass(frozen=True)
+class Taste:
+    """Recent history and artist preferences that steer selection."""
+
+    recent_ids: Collection[str] = ()
+    recent_artists: Collection[str] = ()
+    liked_artists: Collection[str] = ()
+    disliked_artists: Collection[str] = ()
+
+    def __post_init__(self) -> None:
+        # Normalize once, so scoring a large catalog needs only set lookups.
+        object.__setattr__(self, "recent_ids", frozenset(self.recent_ids))
+        for name in ("recent_artists", "liked_artists", "disliked_artists"):
+            object.__setattr__(self, name, frozenset(map(_artist_key, getattr(self, name))))
+
+
+def validate_decision(raw: Mapping[str, object] | CuratorDecision, candidates: Sequence[Artwork]) -> CuratorDecision:
+    """Validate model output against known museum works and renderer limits."""
+    decision = raw if isinstance(raw, CuratorDecision) else CuratorDecision.from_dict(raw)
+    known = {work.id: work for work in candidates}
+    if len(known) != len(candidates):
+        raise DecisionError("Candidate IDs must be unique")
+    for entry in decision.artworks:
+        if entry.id not in known:
+            raise DecisionError(f"Unknown artwork ID: {entry.id}")
+        if entry.crop and min(entry.crop.width, entry.crop.height) < 0.65:
+            raise DecisionError("Artwork crop removes too much of the original")
+    if decision.detail_crop and min(decision.detail_crop.width, decision.detail_crop.height) < 0.08:
+        raise DecisionError("Detail crop is too small")
+    description = _clean_text(decision.description, 500)
+    if len(description.split()) > 50:
+        raise DescriptionGroundingError("Description exceeds 50 words")
+    if len(decision.artworks) == 1 and _clean_text(decision.relationship, 220):
+        raise DecisionError("Single-art layout cannot claim a relationship")
+    works = [known[artwork_id] for artwork_id in decision.artwork_ids]
+    # Relationship text is always rebuilt from museum fields. The model may
+    # choose a grouping, but it cannot invent influence or provenance.
+    relationship = _verified_relationship(works)
+    _validate_description(description, works, known[decision.primary_artwork_id])
+    return replace(decision, relationship=relationship, description=description,
+                   curator_reason=_clean_text(decision.curator_reason, 700))
+
+
+def _relationship(first: Artwork, second: Artwork) -> tuple[int, str]:
+    artist_a = _clean_text(first.artist, 120)
+    artist_b = _clean_text(second.artist, 120)
+    same_artist = bool(artist_a and artist_a.casefold() == artist_b.casefold())
+    series_a = _series_name(first.title)
+    series_b = _series_name(second.title)
+    if same_artist and series_a and series_a.casefold() == series_b.casefold():
+        return 9, f"Two plates from {series_a}, by {artist_a}."
+    if same_artist and series_a and series_b:
+        # Museum titles can spell one series with a short or long subtitle.
+        # Only call them different when their substantive title words do not
+        # overlap; otherwise the safe relationship is simply the same artist.
+        generic_words = {"a", "an", "the", "of", "from", "series", "views", "pictures"}
+        words_a = set(_normalized_phrase(series_a).split()) - generic_words
+        words_b = set(_normalized_phrase(series_b).split()) - generic_words
+        overlap = len(words_a & words_b) / max(min(len(words_a), len(words_b)), 1)
+        if overlap < 0.35:
+            return 6, f"Two prints from different named series by {artist_a}."
+    for label, value_a, value_b in (("movement", first.movement, second.movement),
+                                    ("period", first.period, second.period)):
+        a = _clean_text(value_a, 100)
+        b = _clean_text(value_b, 100)
+        generic_period = bool(re.search(r"\bcentury\b|culture or style", a, re.IGNORECASE))
+        if a and not generic_period and a.casefold() == b.casefold():
+            if same_artist:
+                return 5, f"Two {a} works by {artist_a}."
+            return 3, f"Two works from the same {label}: {a}."
+    tags = sorted(_meaningful_tags(first) & _meaningful_tags(second))
+    if tags:
+        if same_artist:
+            return 5, f"Two works by {artist_a} depicting {tags[0]}."
+        return 3, f"Two approaches to {tags[0]}."
+    culture_a = _clean_text(first.culture, 100)
+    if culture_a and culture_a.casefold() == _clean_text(second.culture, 100).casefold():
+        return 2, f"Two works from {culture_a}."
+    medium_a = _clean_text(first.medium, 100)
+    if same_artist and medium_a and medium_a.casefold() == _clean_text(second.medium, 100).casefold():
+        return 2, f"Two works in {medium_a} by {artist_a}."
+    if same_artist:
+        return 1, f"Two works by {artist_a}."
+    return 0, ""
+
+
+def _series_name(title: str) -> str:
+    """Extract an explicit museum title attribution such as 'from Views of Rome'."""
+    text = _clean_text(title, 350)
+    quoted = re.search(r"\bfrom\s+(?:the\s+)?(?:series|suite)\s+[\"“]([^\"”]+)[\"”]", text, re.IGNORECASE)
+    if quoted:
+        return quoted.group(1).strip(" ,:.")
+    match = re.search(r"\bfrom\s+(?:the\s+(?:series|suite)\s+)?(.+?)(?:,\s+also\s+known\s+as.*)?$", text, re.IGNORECASE)
+    return match.group(1).strip(" ,:.") if match else ""
+
+
+def _normalized_phrase(value: str) -> str:
+    return " ".join(re.findall(r"[^\W_]+", value.casefold().replace("-", " ")))
+
+
+def _sentence_at(text: str, start: int, end: int) -> str:
+    """The sentence of text that contains the span from start to end."""
+    first = max(text.rfind(mark, 0, start) for mark in ".!?") + 1
+    last = min((index for mark in ".!?" if (index := text.find(mark, end)) >= 0), default=len(text))
+    return text[first:last]
+
+
+def _validate_multi_series(description: str, works: Sequence[Artwork]) -> None:
+    if len(works) < 2 or not description:
+        return
+    series = [_series_name(work.title) for work in works]
+    common = bool(series[0] and all(item.casefold() == series[0].casefold() for item in series[1:]))
+    normalized_description = _normalized_phrase(description)
+    named_series = any(
+        (phrase := _normalized_phrase(item.split(" (", 1)[0]))
+        and phrase in normalized_description
+        for item in series
+    )
+    mentions_series = bool(re.search(r"\bseries\b", description, re.IGNORECASE))
+    # Shared wallpaper captions normally refer to the whole set. A statement
+    # explicitly about only one panel may name that panel's own series.
+    single_panel = bool(re.search(r"\b(?:first|second|third|primary|left|right)\b.{0,70}\bseries\b", description, re.IGNORECASE))
+    collective = bool(re.search(r"\b(?:all|both|two|three|these|the\s+works|the\s+prints|the\s+views|the\s+plates)\b", description, re.IGNORECASE))
+    if (mentions_series and not single_panel or named_series and collective) and not common:
+        raise DescriptionGroundingError("Shared caption assigns different works to one unsupported series")
+    if common and mentions_series and not single_panel and not named_series:
+        # The model may say "same series" without spelling it out. If it
+        # names a different series, the source titles must support that name.
+        after = re.search(r"\bseries\s+[\"“]?([^.,;]+)", description, re.IGNORECASE)
+        if after and len(after.group(1).split()) > 1 and _normalized_phrase(series[0].split(" (", 1)[0]) not in _normalized_phrase(after.group(1)):
+            raise DescriptionGroundingError("Caption names a series absent from the museum titles")
+
+
+def _subject_title(title: str) -> str:
+    text = _clean_text(title, 350)
+    return re.split(r",\s+(?:plate\s+\w+\s+)?from\b", text, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+
+
+def _validate_primary_subject(description: str, works: Sequence[Artwork], primary: Artwork) -> None:
+    if len(works) < 2 or not description:
+        return
+    primary_source = _normalized_phrase(f"{primary.title} {primary.museum_description or ''}")
+    normalized_description = _normalized_phrase(description)
+    for work in works:
+        if work.id == primary.id:
+            continue
+        subject = re.sub(r"^(?:the|a|an)\s+", "", _subject_title(work.title), flags=re.IGNORECASE)
+        phrase = _normalized_phrase(subject)
+        if len(phrase.split()) < 2 or phrase in primary_source or phrase not in normalized_description:
+            continue
+        match = re.search(re.escape(subject), description, re.IGNORECASE)
+        sentence = _sentence_at(description, match.start(), match.end()) if match else description
+        if not re.search(r"\b(?:both|two|three|other\s+(?:work|panel|print)|second|third|companion|paired|beside|alongside|right|left)\b", sentence, re.IGNORECASE):
+            raise DescriptionGroundingError("Caption treats a companion artwork's title as the primary subject")
+
+
+def _validate_shared_caption(description: str, works: Sequence[Artwork], primary: Artwork) -> None:
+    """A caption over several works must acknowledge the other panels."""
+    if len(works) < 2 or not description:
+        return
+    if re.search(
+        r"\b(?:both|each|together|pair(?:ed|ing)?|diptych|triptych|"
+        r"companions|these\s+(?:works|prints|views|plates|images|panels))\b",
+        description, re.IGNORECASE,
+    ) or re.search(
+        r"\b(?:two|three)\s+(?:works|prints|views|plates|images|panels|artworks|scenes|stations)\b",
+        description, re.IGNORECASE,
+    ):
+        return
+    normalized = _normalized_phrase(description)
+    companions = [(index, work) for index, work in enumerate(works) if work.id != primary.id]
+    for index, work in companions:
+        subject = _normalized_phrase(_subject_title(work.title))
+        if len(subject.split()) >= 2 and subject in normalized:
+            continue
+        panel_name = (("left", "right") if len(works) == 2 else ("left", "middle", "right"))[index]
+        cues = [panel_name]
+        if panel_name == "middle":
+            cues.append("center")
+        if len(companions) == 1:
+            cues.extend(("companion", "other", "second" if index else "first"))
+        if any(re.search(rf"\b{cue}\b", description, re.IGNORECASE) for cue in cues):
+            continue
+        raise DescriptionGroundingError("Shared description must mention each companion or the whole pairing")
+
+
+def _shared(values: Sequence[str | None]) -> str:
+    cleaned = [_clean_text(value, 120) for value in values]
+    return cleaned[0] if cleaned[0] and all(value.casefold() == cleaned[0].casefold() for value in cleaned[1:]) else ""
+
+
+_GENERIC_TAGS = frozenset({
+    "print", "prints and drawing", "paper (fiber product)", "etching", "engraving",
+    "painting", "paint", "canvas", "painting techniques", "painting (image making)",
+    "oil painting", "oil paintings (visual works)", "oil paint (paint)", "oil on canvas",
+    "french", "france", "european painting", "water", "nature", "landscapes",
+    "century of progress", "world's fairs", "chicago world's fairs",
+    "asian art", "east asian art", "japanese art", "japan", "japanese", "asia",
+})
+
+
+def _meaningful_tags(work: Artwork) -> set[str]:
+    return {
+        tag for raw in work.subject_tags or ()
+        if (tag := raw.casefold().strip()) and tag not in _GENERIC_TAGS
+        and not re.fullmatch(r"(?:\d+(?:st|nd|rd|th)|eighteenth|nineteenth|twentieth) century", tag)
+    }
+
+
+def _verified_relationship(works: Sequence[Artwork]) -> str:
+    if len(works) == 1:
+        return ""
+    if len(works) == 2:
+        _, rationale = _relationship(works[0], works[1])
+        if not rationale:
+            raise DecisionError("No museum-grounded relationship for paired works")
+        return rationale
+    artist = _shared([work.artist for work in works])
+    series = [_series_name(work.title) for work in works]
+    if artist and series[0] and all(value.casefold() == series[0].casefold() for value in series[1:]):
+        return f"Three plates from {series[0]}, by {artist}."
+    if artist:
+        return f"Three works by {artist}."
+    for label, values in (("movement", [work.movement for work in works]),
+                          ("period", [work.period for work in works]),
+                          ("culture", [work.culture for work in works])):
+        common = _shared(values)
+        if common:
+            return f"Three works from the same {label}: {common}."
+    tags = set.intersection(*(_meaningful_tags(work) for work in works))
+    if tags:
+        return f"Three approaches to {sorted(tags)[0]}."
+    raise DecisionError("No museum-grounded relationship for triptych")
+
+
+_HISTORICAL_CLAIM = re.compile(
+    r"\b(?:commissioned|patron(?:age)?|provenance|owned|collected|published|"
+    r"exhibited|excavated|discovered|influenced|inspired|symboliz(?:es|ed)|"
+    r"represents|originally|commemorat\w*|memorializ\w*|document\w*|"
+    r"first\s+(?:shown|made|published)|(?:studied|trained)\s+(?:under|with)|"
+    r"learned\s+from|taught\s+by|(?:meant|supposed)\s+to|"
+    r"(?:made|created|designed|produced|printed|used|intended)\s+(?:for|to|during)|"
+    r"(?:belonged|served)\s+(?:to|as)|(?:after|before)\s+(?:visiting|studying)|"
+    r"based\s+on|during\s+the\s+\w+\s+(?:century|war))\b",
+    re.IGNORECASE,
+)
+_SENTENCE_STARTERS = {
+    "a", "an", "and", "across", "at", "above", "below", "beneath", "behind",
+    "both", "bright", "broad", "cool", "curving", "dark", "deep", "dense", "distant",
+    "each", "faint", "fine", "gray", "grey", "here", "in", "intricate", "its",
+    "large", "layered", "left", "light", "long", "look", "low", "notice", "on",
+    "one", "pale", "sharp", "slender", "small", "soft", "steep", "subtle",
+    "the", "their", "these", "this", "warm",
+    "through", "tiny", "together", "two", "three", "while", "with",
+}
+
+
+def _name_key(token: str) -> str:
+    return re.sub(r"(?:['’]s)$", "", token.casefold())
+
+
+def _trusted_text(works: Iterable[Artwork]) -> str:
+    return " ".join(str(value) for work in works for value in (
+        work.title, work.artist, work.date_display, work.date_start, work.date_end, work.medium,
+        work.culture, work.geographic_origin, work.period, work.style, work.movement,
+        _tags(work), work.museum_description,
+    ) if value is not None)
+
+
+def _validate_description(description: str, works: Sequence[Artwork], primary: Artwork) -> None:
+    if not description:
+        return
+    _validate_primary_subject(description, works, primary)
+    _validate_shared_caption(description, works, primary)
+    _validate_multi_series(description, works)
+    trusted = _trusted_text(works)
+    if set(re.findall(r"\b\d{3,4}\b", description)) - set(re.findall(r"\b\d{3,4}\b", trusted)):
+        raise DescriptionGroundingError("Description contains an unsupported historical number")
+    # A deterministic extract from the museum is authoritative even when a
+    # companion work has no description of its own.
+    extract = description.rstrip("…").strip()
+    if extract and any(_clean_text(work.museum_description, 3000).startswith(extract) for work in works):
+        return
+    # A source description provides facts, but its mere presence does not
+    # ground every claim a model could add. Only a direct museum extract gets
+    # the bypass above; otherwise apply conservative claim and name checks.
+    if _HISTORICAL_CLAIM.search(description):
+        raise DescriptionGroundingError("Description makes an unsupported historical or provenance claim")
+    trusted_tokens = {_name_key(match.group()) for match in _NAME.finditer(trusted)}
+    for match in _NAME.finditer(description):
+        token = match.group()
+        if not token[0].isupper() or _name_key(token) in trusted_tokens:
+            continue
+        prefix = description[:match.start()].rstrip()
+        if (not prefix or prefix[-1] in ".!?") and _name_key(token) in _SENTENCE_STARTERS:
+            continue
+        raise DescriptionGroundingError(f"Description names unsupported entity: {token}")
+
+
+def score_candidate(artwork: Artwork, taste: Taste = Taste()) -> float:
+    """Cheap local taste and novelty score; never invents facts."""
+    artist = _artist_key(artwork.artist)
+    if artwork.id in taste.recent_ids or (artist and artist in taste.disliked_artists):
+        return -math.inf
+    score = 1.0
+    if artist in SEED_ARTISTS:
+        score += 2.2
+    if artist and artist in taste.liked_artists:
+        score += 2.8
+    if artist and artist in taste.recent_artists:
+        score -= 3.0
+    terms = " ".join((artwork.title, artwork.movement or "", artwork.period or "", artwork.medium or "",
+                      _tags(artwork), artwork.museum_description or "")).casefold()
+    score += min(2.2, 0.35 * sum(theme in terms for theme in SEED_THEMES))
+    if _series_name(artwork.title):
+        score += 0.6  # an explicit series can support a specific pairing
+    if "great wave" in artwork.title.casefold():
+        score -= 2.0
+    pixels = (artwork.image_width or 0) * (artwork.image_height or 0)
+    score += min(0.8, max(-1.5, math.log2(max(pixels, 1) / 2_000_000) * 0.25))
+    ratio = _ratio(artwork)
+    if 1.7 <= ratio <= 2.8:
+        score += 1.0
+    elif 1.1 <= ratio < 1.7:
+        score += 0.9  # two such works can fill an ultrawide diptych
+    elif 0.65 <= ratio < 1.1:
+        score += 0.1  # needs three related works to avoid large side gutters
+    return score
+
+
+def _ranked(candidates: Iterable[Artwork], taste: Taste) -> list[Artwork]:
+    """Eligible public-domain works with known dimensions, best first."""
+    scored = [(score_candidate(work, taste), work) for work in candidates
+              if work.public_domain and work.image_width and work.image_height]
+    return [work for score, work in sorted(scored, key=lambda pair: (-pair[0], pair[1].id))
+            if score > -math.inf]
+
+
+def source_description(artwork: Artwork) -> str:
+    """A short caption taken directly from the museum's own description."""
+    source = _clean_text(artwork.museum_description, 3000)
+    words = source.split()
+    if len(words) <= 50:
+        return source
+    sentence = re.split(r"(?<=[.!?])\s+", source)[0]
+    if 20 <= len(sentence.split()) <= 50:
+        return sentence
+    return " ".join(words[:45]).rstrip(" ,;:") + "…"
+
+
+def deterministic_decision(candidates: Sequence[Artwork], taste: Taste = Taste()) -> CuratorDecision:
+    """Curate from cached metadata when the local model is unavailable."""
+    ranked = _ranked(candidates, taste)
+    if not ranked:
+        raise DecisionError("No eligible, unseen public-domain artworks")
+    first = ranked[0]
+    related = []
+    for work in ranked[1:]:
+        strength, rationale = _relationship(first, work)
+        if strength >= 3:
+            related.append((strength, work, rationale))
+    related.sort(key=lambda item: (-item[0], -score_candidate(item[1]), item[1].id))
+    layout = _single_layout(first)
+    selected = [first]
+    if (len(related) >= 2
+            and related[0][2] == related[1][2]
+            and all(_ratio(work) <= 1.15 for work in (first, related[0][1], related[1][1]))):
+        selected += [related[0][1], related[1][1]]
+        layout = "triptych"
+    elif related and _ratio(first) < 1.65 and _ratio(related[0][1]) < 1.65:
+        selected.append(related[0][1])
+        layout = "diptych_50" if abs(_ratio(first) - _ratio(related[0][1])) < 0.45 else "diptych_60"
+    decision = CuratorDecision(
+        layout=layout, primary_artwork_id=first.id,
+        artworks=tuple(DecisionArtwork(work.id) for work in selected),
+        description=source_description(first) if len(selected) == 1 else "",
+        curator_reason="Deterministic selection from public-domain works, taste seeds, and recent history.",
+    )
+    return validate_decision(decision, candidates)
+
+
+def _parse_model_json(content: str) -> Any:
+    # Some local vision models wrap JSON in a Markdown fence even in JSON mode.
+    content = content.strip()
+    if content.startswith("```json") and content.endswith("```"):
+        content = content[7:-3].strip()
+    elif content.startswith("```") and content.endswith("```"):
+        content = content[3:-3].strip()
+    return json.loads(content)
+
+
+def _contact_sheet(candidates: Sequence[Artwork], *, cell_w: int = 260,
+                   cell_h: int = 204, columns: int = 4) -> bytes:
+    """One compact labeled image for visual judgment; originals stay local."""
+    if not candidates:
+        raise DecisionError("No cached images available for multimodal curation")
+    rows = math.ceil(len(candidates) / columns)
+    sheet = Image.new("RGB", (cell_w * columns, cell_h * rows), "#282828")
+    draw = ImageDraw.Draw(sheet)
+    for index, artwork in enumerate(candidates):
+        path = artwork.cached_image_path
+        if not path or not Path(path).is_file():
+            raise DecisionError(f"Missing cached image for {artwork.id}")
+        try:
+            with Image.open(path) as original:
+                thumb = ImageOps.contain(original.convert("RGB"), (cell_w - 12, cell_h - 34), Image.Resampling.LANCZOS)
+        except (OSError, ValueError) as exc:
+            raise DecisionError(f"Unreadable cached image for {artwork.id}") from exc
+        x = (index % columns) * cell_w
+        y = (index // columns) * cell_h
+        sheet.paste(thumb, (x + (cell_w - thumb.width) // 2, y + (cell_h - 34 - thumb.height) // 2))
+        draw.text((x + 7, y + cell_h - 26), f"{index + 1:02d}  {artwork.id[:29]}", fill="#ebdbb2")
+    output = BytesIO()
+    sheet.save(output, format="JPEG", quality=82, optimize=True)
+    return output.getvalue()
+
+
+def _facts(work: Artwork) -> dict[str, str]:
+    """Museum fields a caption may rely on, trimmed for a prompt."""
+    return {
+        "title": _clean_text(work.title, 220), "artist": _clean_text(work.artist, 120),
+        "date": _clean_text(work.date_display, 80), "medium": _clean_text(work.medium, 120),
+        "style": _clean_text(work.style, 100), "period": _clean_text(work.period, 100),
+        "movement": _clean_text(work.movement, 100), "culture": _clean_text(work.culture, 100),
+        "geographic_origin": _clean_text(work.geographic_origin, 100),
+        "subject_tags": _clean_text(_tags(work), 220),
+        "museum_description": _clean_text(work.museum_description, 900),
+    }
+
+
+def _compact_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+class OllamaCurator:
+    """Curate with an installed local vision model; fall back without network."""
+
+    def __init__(self, model: str = "qwen3.6:27b", base_url: str = "http://127.0.0.1:11434",
+                 timeout: int = 300, description_words: int = 40) -> None:
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.description_words = max(20, min(50, int(description_words)))
+
+    def _chat(self, prompt: str, *, image: bytes | None = None, temperature: float = 0,
+              num_predict: int = 180, num_ctx: int = 8192, timeout: float | None = None) -> Any:
+        """Send one local Ollama chat request and parse its JSON answer."""
+        message: dict[str, Any] = {"role": "user", "content": prompt}
+        if image is not None:
+            message["images"] = [base64.b64encode(image).decode("ascii")]
+        payload = {
+            "model": self.model,
+            "messages": [message],
+            # Ollama 0.18.3 occasionally ignores a complex schema for
+            # vision requests. JSON mode plus strict local validation is
+            # more reliable with the installed Qwen vision models.
+            "format": "json", "stream": False, "think": False,
+            "options": {"temperature": temperature, "num_predict": num_predict, "num_ctx": num_ctx},
+        }
+        req = request.Request(
+            self.base_url + "/api/chat", data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with request.urlopen(req, timeout=timeout or self.timeout) as response:
+            outer = json.load(response)
+        return _parse_model_json(outer["message"]["content"])
+
+    def _description(self, prompt: str, **options: Any) -> str:
+        value = self._chat(prompt, **options)
+        if not isinstance(value, Mapping) or not isinstance(value.get("description"), str):
+            raise DescriptionGroundingError("Caption must be a JSON string")
+        description = _clean_text(value["description"], 500)
+        if not 20 <= len(description.split()) <= 50:
+            raise DescriptionGroundingError("Caption must contain 20-50 words")
+        return description
+
+    def _repair_description(self, draft: CuratorDecision, candidates: Sequence[Artwork], reason: str) -> str:
+        """One text-only rewrite; a failed repair leaves the caption empty."""
+        by_id = {work.id: work for work in candidates}
+        works = [by_id[artwork_id] for artwork_id in draft.artwork_ids]
+        prompt = (
+            "Rewrite this rejected museum wallpaper description in 25-40 words. "
+            "Make it a useful observation, not a restatement or list of the artwork title. "
+            "Mention at most one named structure or place; describe a visible contrast in scale, line, light, or space instead. "
+            "For multi-art layouts, explain a concrete detail in both the primary and each companion work, "
+            "and connect them in one shared description; do not describe a companion title as the primary work's subject. "
+            "Identify another panel with its short title or a clear panel location such as 'the right print'. "
+            "Avoid generic praise such as 'visionary' or 'embraces the sublime' without a specific visible detail. "
+            "Keep only visual observations already in the draft and facts explicitly present in trusted metadata. "
+            "If museum_description is empty, do not add any historical, provenance, purpose, symbolism, or influence claims. "
+            "For multiple works, name one shared series only when every selected museum title names that same series. "
+            "Do not repeat the unsupported assertion identified in the rejection reason. "
+            "Use only named people, places, or styles present verbatim in trusted metadata. "
+            "Return JSON with exactly one key: description. "
+            "Rejection reason: " + reason + "\n"
+            "Draft: " + _clean_text(draft.description, 500) + "\n"
+            "Trusted metadata: " + _compact_json([_facts(work) for work in works])
+        )
+        try:
+            repaired = self._description(prompt, num_ctx=2048, timeout=min(self.timeout, 90))
+            _validate_description(repaired, works, by_id[draft.primary_artwork_id])
+            return repaired
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            LOG.warning("ollama_curator_caption_repair_failed reason=%s", exc)
+            return ""
+
+    def describe_final(self, decision: CuratorDecision, candidates: Sequence[Artwork]) -> CuratorDecision:
+        """Describe the final selected artwork(s) after a layout change.
+
+        This uses only the local vision model. A failed or ungrounded answer
+        falls back to source text for one work or an empty shared caption.
+        """
+        by_id = {work.id: work for work in candidates}
+        primary = by_id.get(decision.primary_artwork_id)
+        fallback = replace(decision, description=source_description(primary)
+                           if primary and len(decision.artworks) == 1 else "")
+        try:
+            works = [by_id[artwork_id] for artwork_id in decision.artwork_ids]
+            metadata = [{"panel": index + 1, "id": work.id, **_facts(work)} for index, work in enumerate(works)]
+            opening = (
+                "Write ONE 20-50 word museum wallpaper description of the single artwork in the image. "
+                "Mention one or two concrete visible details worth noticing. "
+                if len(works) == 1 else
+                "Write ONE 20-50 word shared museum wallpaper description for ALL the numbered works "
+                "in the contact sheet. Mention one concrete visible detail in the primary work and "
+                "one in EACH companion work. Identify companions by a short title or clear panel "
+                "location, then explain a visible relationship or contrast. Never merely list titles. "
+            )
+            prompt = (
+                opening +
+                "The images show visual form; only the supplied museum metadata can establish "
+                "artist, date, style, series, subject, history, or a factual relationship. "
+                "Do not name a shared series unless every selected museum title names it. "
+                "Do not invent provenance, patronage, meaning, influence, or historical claims. "
+                "When source descriptions are absent, limit the explanation to visible shape, "
+                "color, line, scale, figures, and placement. Return JSON with exactly one string "
+                "key named description. Primary artwork ID: " + decision.primary_artwork_id + ". "
+                "Verified relationship: " + decision.relationship + ". "
+                "Museum metadata: " + _compact_json(metadata)
+            )
+            description = self._description(
+                prompt, image=_contact_sheet(works, cell_w=500, cell_h=360, columns=2),
+                timeout=min(self.timeout, 120),
+            )
+            return validate_decision(replace(fallback, description=description), works)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            LOG.warning("ollama_final_caption_failed reason=%s", exc)
+            return fallback
+
+    def curate(self, candidates: Sequence[Artwork], taste: Taste = Taste(), *,
+               max_artworks: int = 3) -> CuratorDecision:
+        # Only offer visual candidates that can actually be shown to the model.
+        ranked = [work for work in _ranked(candidates, taste)
+                  if work.cached_image_path and Path(work.cached_image_path).is_file()][:24]
+        if not ranked:
+            raise DecisionError("No eligible, unseen public-domain artworks")
+        try:
+            metadata = [
+                {"number": index + 1, "id": work.id,
+                 "title": _clean_text(work.title, 140),
+                 "artist": _clean_text(work.artist, 100),
+                 "date": _clean_text(work.date_display, 70),
+                 "medium": _clean_text(work.medium, 90),
+                 "period": _clean_text(work.period or work.movement, 90),
+                 "culture": _clean_text(work.culture, 70),
+                 "tags": _clean_text(_tags(work), 160),
+                 "museum_description": _clean_text(work.museum_description, 420),
+                 "allowed_named_words": sorted({
+                     match.group() for value in (work.title, work.artist, work.style, work.period, work.movement,
+                                                 work.culture, work.geographic_origin, work.museum_description)
+                     for match in _NAME.finditer(value or "") if match.group()[0].isupper()
+                 })[:30],
+                 "aspect_ratio": round(_ratio(work), 3)}
+                for index, work in enumerate(ranked)
+            ]
+            example = CuratorDecision(
+                layout="single", primary_artwork_id=ranked[0].id, artworks=(DecisionArtwork(ranked[0].id),),
+                curator_reason="visual and compositional reason for the choice",
+            )
+            prompt = (
+                "You are an art curator designing one 3440x1440 ultrawide wallpaper. "
+                "The numbered contact sheet is the visual evidence; JSON metadata is the only authority for titles, artists, dates, periods, and history. "
+                f"Select {('exactly one work' if max_artworks == 1 else f'1-{max_artworks} works')}, preserve its composition when selecting one, and prefer related works when combining several. "
+                "A single work with a narrow aspect ratio should be shown intact against a quiet color sampled from the artwork, with its caption in the surrounding space. "
+                "Artwork should dominate the screen. Avoid faces and focal objects under the caption; avoid the center where lock UI may appear. "
+                "Normal artwork crops must retain at least 65% of both dimensions. Use artwork_detail only for a meaningful enlarged detail of the same work. "
+                + ("Choose only single or near_single layout; do not choose artwork_detail. " if max_artworks == 1 else "") +
+                "Choose a caption corner and a subtle gradient if needed. "
+                f"Aim for about {self.description_words} words of educational description, never more than 50, "
+                "and only when supported by museum_description or supplied metadata. "
+                "When museum_description is empty, describe only visible form: line, light, color, scale, figures, and placement. "
+                "Do not enumerate a long museum title; mention at most one named structure and focus on one or two things to notice. "
+                "For a multi-art layout, write ONE shared description of every selected work, with one visible detail from each. "
+                "Identify companions by a short title or clear panel location, and explain the visual relationship or contrast. "
+                "Never describe a companion's title as the primary work's subject. Avoid generic praise or style clichés without a concrete visible detail. "
+                "In that case name only people, places, styles, and dates explicitly present in the metadata. "
+                "Never assert commission, ownership, publication, influence, purpose, symbolism, or provenance without museum support. "
+                "Recently shown artists should be used sparingly: " + json.dumps(sorted(taste.recent_artists), ensure_ascii=False) + ". "
+                "Use exact candidate id strings. Multi-art decisions require a specific, factual relationship. "
+                "Never call multiple selected works part of one named series unless every selected museum title names that exact series. "
+                "Return exactly these JSON keys and types. This example shows the shape, not the recommended artwork or layout: "
+                + _compact_json(example.to_dict()) + ". "
+                "Choose the best art and layout independently. For normal art crops use null unless you are confident the crop is safe. "
+                "For artwork_detail, detail_crop is a normalized x/y/width/height object. "
+                "JSON only, no Markdown. "
+                "\nCandidates: " + _compact_json(metadata)
+            )
+            draft = CuratorDecision.from_dict(self._chat(
+                prompt, image=_contact_sheet(ranked), temperature=0.2, num_predict=600,
+            ))
+            try:
+                decision = validate_decision(draft, ranked)
+            except DescriptionGroundingError as exc:
+                # Keep a good visual selection while discarding only the
+                # unsupported caption. A short text-only rewrite can recover
+                # an educational observation without another image request.
+                LOG.warning("ollama_curator_caption_rejected reason=%s", exc)
+                # A primary-only draft lacks evidence about the companions.
+                # The final selected images need a second vision pass.
+                repaired = "" if len(draft.artworks) > 1 else self._repair_description(draft, ranked, str(exc))
+                decision = validate_decision(replace(draft, description=repaired), ranked)
+            if len(decision.artworks) > 1 and not decision.description:
+                decision = self.describe_final(decision, ranked)
+            known = {work.id: work for work in ranked}
+            try:
+                _validate_description(decision.curator_reason, [known[i] for i in decision.artwork_ids],
+                                      known[decision.primary_artwork_id])
+            except DescriptionGroundingError:
+                decision = replace(
+                    decision,
+                    curator_reason="Local model selected this visual composition; artwork facts and relationships come from museum metadata.",
+                )
+            LOG.info("ollama_curator_choice model=%s layout=%s artworks=%s",
+                     self.model, decision.layout, decision.artwork_ids)
+            return decision
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            LOG.warning("ollama_curator_fallback reason=%s", exc)
+            LOG.debug("ollama_curator_fallback_trace", exc_info=True)
+            fallback = deterministic_decision(candidates, taste)
+            return replace(fallback, curator_reason=(
+                f"Local model unavailable or invalid ({type(exc).__name__}); {fallback.curator_reason}"))
+
+
+def limit_artworks(decision: CuratorDecision, pool: Sequence[Artwork], limit: int) -> CuratorDecision:
+    """Reduce a decision to the configured number of works."""
+    if len(decision.artworks) <= limit and not (limit == 1 and decision.layout == "artwork_detail"):
+        return decision
+    primary = next(entry for entry in decision.artworks if entry.id == decision.primary_artwork_id)
+    if limit == 2:
+        companion = next(entry for entry in decision.artworks if entry.id != primary.id)
+        try:
+            return validate_decision(replace(decision, layout="diptych_50", artworks=(primary, companion),
+                                             description="", detail_crop=None), pool)
+        except DecisionError:
+            pass
+    work = next(art for art in pool if art.id == primary.id)
+    return validate_decision(replace(
+        decision, layout=_single_layout(work), artworks=(primary,), relationship="",
+        description=source_description(work), detail_crop=None,
+        curator_reason=decision.curator_reason + " Limited to one work by max_artworks setting.",
+    ), pool)
+
+
+def ensure_coverage(decision: CuratorDecision, pool: Sequence[Artwork], *,
+                    max_artworks: int, screen_ratio: float) -> CuratorDecision:
+    """Use related panels for coverage only when the artwork limit allows them."""
+    if max_artworks == 1 or decision.layout == "artwork_detail":
+        return decision
+    by_id = {work.id: work for work in pool}
+    primary = by_id[decision.primary_artwork_id]
+    ratio = _ratio(primary)
+    total = sum(_ratio(by_id[artwork_id]) for artwork_id in decision.artwork_ids)
+    if decision.layout in ("single", "near_single"):
+        if ratio >= screen_ratio * 0.75:
+            return decision
+    elif _fit(total, screen_ratio) >= 0.75:
+        return decision
+
+    def revised(layout: Layout, artworks: tuple[DecisionArtwork, ...], note: str) -> CuratorDecision:
+        # A description belongs to a precise set of works. A change in that
+        # set needs another visual description, not a primary-only leftover.
+        # Validation rebuilds the relationship from museum fields.
+        return validate_decision(replace(
+            decision, layout=layout, artworks=artworks, detail_crop=None, relationship="",
+            description=decision.description if len(artworks) == len(decision.artworks) else "",
+            curator_reason=decision.curator_reason + note,
+        ), pool)
+
+    options: list[tuple[float, CuratorDecision]] = []
+    if decision.layout in ("single", "near_single", "triptych"):
+        companions = pool if len(decision.artworks) == 1 else [work for work in pool if work.id in decision.artwork_ids]
+        for companion in companions:
+            fit = _fit(ratio + _ratio(companion), screen_ratio)
+            if companion.id == primary.id or fit < 0.76:
+                continue
+            try:
+                paired = revised("diptych_50", (DecisionArtwork(primary.id), DecisionArtwork(companion.id)),
+                                 " Layout revised to preserve artwork coverage.")
+            except DecisionError:
+                continue
+            rationale = paired.relationship.casefold()
+            options.append((fit + (3 if "plates from" in rationale else 2 if "by " in rationale else 1), paired))
+    elif max_artworks >= 3:  # a diptych that leaves too much of the screen empty
+        for companion in pool:
+            fit = _fit(total + _ratio(companion), screen_ratio)
+            if companion.id in decision.artwork_ids or fit < 0.76:
+                continue
+            try:
+                options.append((fit, revised("triptych", (*decision.artworks, DecisionArtwork(companion.id)),
+                                             " Third related work added to preserve artwork coverage.")))
+            except DecisionError:
+                continue
+    if options:
+        return max(options, key=lambda option: option[0])[1]
+    return revised("artwork_detail", (DecisionArtwork(primary.id),),
+                   " Same-work detail added to preserve artwork coverage.")
+
+
+def choose_composition(pool: Sequence[Artwork], taste: Taste, *, max_artworks: int, screen_ratio: float,
+                       curator: OllamaCurator | None = None) -> CuratorDecision:
+    """Select works, fit them to the artwork limit and screen, and describe the final set."""
+    if curator is None:
+        decision = deterministic_decision(pool, taste)
+    else:
+        decision = curator.curate(pool, taste, max_artworks=max_artworks)
+    chosen = decision.artwork_ids
+    decision = limit_artworks(decision, pool, max_artworks)
+    decision = ensure_coverage(decision, pool, max_artworks=max_artworks, screen_ratio=screen_ratio)
+    if curator is not None and (decision.artwork_ids != chosen
+                                or (len(decision.artworks) == 1 and not decision.description)):
+        decision = curator.describe_final(decision, pool)
+    return decision

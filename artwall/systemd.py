@@ -1,0 +1,101 @@
+"""Generate user timers from the active artwall configuration."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import subprocess
+from typing import Callable
+
+from artwall.config import Settings, config_home
+
+
+def user_unit_dir() -> Path:
+    return config_home() / "systemd" / "user"
+
+
+def unit_contents(settings: Settings, executable: str) -> dict[str, str]:
+    if not executable.startswith("/") or any(ch in executable for ch in "\n\r\x00"):
+        raise ValueError("Systemd needs an absolute artwall executable path")
+    if " " in executable:
+        raise ValueError("Systemd executable path may not contain spaces")
+    return {
+        "artwall-rotate.service": f"""[Unit]
+Description=Rotate to the next cached museum wallpaper
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart={executable} next
+""",
+        "artwall-rotate.timer": f"""[Unit]
+Description=Rotate museum wallpaper every {settings.interval_minutes} minutes
+
+[Timer]
+OnActiveSec={settings.interval_minutes}min
+OnUnitActiveSec={settings.interval_minutes}min
+Persistent=true
+Unit=artwall-rotate.service
+
+[Install]
+WantedBy=timers.target
+""",
+        "artwall-curate.service": f"""[Unit]
+Description=Refresh museum catalog and prepare offline wallpapers
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=2h
+ExecStart={executable} refresh
+ExecStart={executable} curate
+""",
+        "artwall-curate.timer": """[Unit]
+Description=Prepare museum wallpapers daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=45min
+Unit=artwall-curate.service
+
+[Install]
+WantedBy=timers.target
+""",
+    }
+
+
+def write_units(settings: Settings, directory: Path, executable: str) -> list[Path]:
+    directory.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for name, content in unit_contents(settings, executable).items():
+        path = directory / name
+        path.write_text(content, encoding="utf-8")
+        paths.append(path)
+    return paths
+
+
+def update_rotate_timer(
+    settings: Settings,
+    executable: str,
+    *,
+    directory: Path | None = None,
+    runner: Callable[..., object] = subprocess.run,
+) -> bool:
+    """Update an installed rotation timer after a GUI interval change.
+
+    Return False when timers have not been installed or user systemd is
+    unavailable. The caller's saved configuration remains valid either way.
+    """
+    directory = directory or user_unit_dir()
+    service = directory / "artwall-rotate.service"
+    timer = directory / "artwall-rotate.timer"
+    if not service.is_file() or not timer.is_file():
+        return False
+    content = unit_contents(settings, executable)["artwall-rotate.timer"]
+    timer.write_text(content, encoding="utf-8")
+    try:
+        runner(["systemctl", "--user", "daemon-reload"], check=True)
+        runner(["systemctl", "--user", "try-restart", "artwall-rotate.timer"], check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True

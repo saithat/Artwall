@@ -1,0 +1,34 @@
+[display]
+width = 3440
+height = 1440
+
+[rotation]
+interval_minutes = 120
+
+[wallpaper]
+backend = "auto" # On this Niri desktop, auto selects DMS; awww and swww are supported.
+# output = "DP-1"
+
+[lockscreen]
+backend = "auto" # DMS here; Hyprlock if installed elsewhere; "none" keeps a separate lock image.
+public_lock_screen_safe = false
+
+[sources]
+artic = true
+public_domain_only = true
+
+[curation]
+batch_size = 14
+candidate_pool_size = 30
+max_artworks = 1 # Choose 1, 2, or 3; the default shows a single work.
+explore_fraction = 0.25
+wildcard_fraction = 0.15
+
+[caption]
+description_words = 40
+show_medium = false
+
+[llm]
+enabled = true
+model = "qwen3.6:27b" # Locally installed vision model in Ollama.
+base_url = "http://127.0.0.1:11434"

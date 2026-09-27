@@ -1,1 +1,111 @@
-# wallpaper-curator
+# Artwall
+
+A local, open-source-friendly museum curator for a Wayland desktop. It discovers public-domain works from the Art Institute of Chicago, asks a **local vision model** to select and compose them, renders 3440 × 1440 wallpapers with small editorial captions, and keeps a ready-to-show offline queue. One artwork per wallpaper is the default.
+
+Artwork is never generated or recolored. The museum supplies titles, artists, dates, rights, and source pages. The model chooses the work, layout, and short source-grounded caption. Rendering is deterministic. A narrow work remains intact on a muted matte drawn from its colors, with the caption in the exposed space when it fits.
+
+## First wallpaper
+
+This Fedora/Niri setup has DMS (DankMaterialShell), which artwall auto-detects for both desktop wallpaper and lock screen. `awww` and `swww` wallpaper adapters are also available if installed. The same rendered composition is sent to the desktop and DMS lock screen.
+
+```bash
+uv tool install --editable .
+artwall init
+artwall refresh
+artwall curate --count 3
+artwall next
+```
+
+`artwall next --no-apply` updates the local current composition without contacting the graphical session; it is useful from a terminal outside Niri. The canonical current files are `~/.cache/artwall/current.png` and `current.json` (unless XDG paths are customized). Source originals and queued PNGs live under `~/.local/share/artwall/`.
+
+The default local curator is the installed `qwen3.6:27b` vision model through Ollama. Keep the Ollama daemon running when preparing new compositions. A failed or unavailable model falls back to deterministic, metadata-based curation. Rotation itself never calls Ollama or a museum API. To prepare a queue entirely without the model:
+
+```bash
+artwall curate --offline --count 5
+```
+
+The Art Institute asks clients to download one image at a time with about a second between requests. An initial refresh and cache fill can take a few minutes. Later runs reuse SQLite API responses and image files. Scheduled refreshes advance through results pages, so the local catalog continues to expand; `artwall refresh --page N` targets a page explicitly.
+
+## Everyday commands
+
+```text
+artwall next                    Next cached composition
+artwall gui                     Open the local curator interface
+artwall previous                Return to an earlier composition
+artwall like | dislike          Teach taste; dislike also shows the next work
+artwall favorite | skip         Save or move on
+artwall more-from-artist        Increase the current artist's score
+artwall less-from-artist        Decrease it
+artwall blacklist-current       Exclude the primary work
+artwall blacklist-artist        Exclude the primary artist
+artwall info                    All works, caption, relationship, museum links
+artwall open                    Open the primary museum page
+artwall history | favorites     Inspect local records
+artwall status                  Queue and current image
+artwall debug-current           Raw museum metadata and curator decision
+artwall render --output FILE    Re-render the current decision
+artwall refresh                 Update museum metadata
+artwall curate --count 14       Prepare future wallpapers
+```
+
+The commands are intentionally small so they can be bound in `~/.config/niri/config.kdl`. For example, a Niri `spawn` binding can run `artwall next` or `artwall favorite`; see Niri's syntax for the version installed on your machine.
+
+## Local interface
+
+Run `artwall gui` to open the local interface at `http://127.0.0.1:8765`. It shows the current wallpaper, upcoming rotation, and history. You can like, dislike, or comment on a composition; set the rotation interval and local Ollama model; maintain artist and artwork blacklists; and allow one, two, or three concurrent works. It serves only on loopback and uses no remote web assets. The command `artwall gui --no-open` starts the interface without opening a browser.
+
+Thumbs down on the current work immediately shows the next eligible cached composition. Thumbs down on an upcoming work removes it from rotation. The disliked work stays out of future curation until that feedback is reversed. If no alternative is cached, the dislike is saved and the gallery says why the wallpaper stayed put.
+
+Changing the artwork limit filters previously queued multiwork compositions from rotation immediately. Prepare fresh single artwork wallpapers with `artwall curate`. Previously viewed compositions remain in history.
+
+## Scheduling
+
+After the first wallpaper works in the Niri session:
+
+```bash
+artwall install-timers
+```
+
+This writes four `systemd --user` units under `~/.config/systemd/user/` and enables the rotation and daily curation timers. Rotation shows an already rendered image every two hours by default. Daily curation refreshes ArtIC metadata and renders the next queue. The interface updates an installed rotation timer when you change the interval. If you edit `[rotation].interval_minutes` by hand, run `artwall install-timers` again. `artwall install-timers --no-enable` writes the units without enabling them.
+
+## Configuration
+
+`artwall init` writes `~/.config/artwall/config.toml` from [config.example.toml](artwall/config.example.toml). Defaults target 3440 × 1440, but width and height are configurable. Values must use their TOML types (for example `true`, not `"true"`); a mistyped value is refused rather than guessed. Notable options:
+
+- `[wallpaper].backend`: `auto`, `dms`, `awww`, or `swww`.
+- `[lockscreen].backend`: `auto`, `dms`, `hyprlock`, or `none` for a separate lock image.
+- `[lockscreen].public_lock_screen_safe`: conservative metadata keyword filtering when `true`. This is a best-effort filter, not image classification.
+- `[llm].enabled`, `model`, and `base_url`: local Ollama vision curation. No cloud API key is used.
+- `[curation].max_artworks`: `1` by default; raise to `2` or `3` to allow paired works again.
+- `[curation].explore_fraction` and `wildcard_fraction`: retain discovery alongside learned favorites.
+
+When using `awww` or `swww`, start its daemon in your Niri session. On this machine, DMS is already the active wallpaper and lock-screen layer, so `auto` selects it. The DMS backend passes an immutable composition path on every rotation to avoid stale wallpaper caching.
+
+With Hyprlock, artwall configures its background to reference `~/.cache/artwall/current.png` once and leaves other lock-screen settings intact. If the Hyprlock configuration only includes sourced files, set its background path manually to the current image or use a direct background block; artwall does not guess which included file to rewrite.
+
+## How it works
+
+1. **Retrieve:** ArtIC's API supplies public-domain artworks with source URLs and rights metadata. SQLite caches API responses and normalized records.
+2. **Filter and rank:** Recent works and blacklisted items are excluded; taste seeds, explicit artist feedback, novelty, resolution, and a configurable mix of exploration select a candidate pool.
+3. **Curate:** Ollama receives a labeled contact sheet of cached thumbnails plus museum metadata. It returns a constrained JSON decision. With the default limit it selects one work. If a multiwork selection must be reduced to one, a second local vision pass describes the final work. Local validation checks IDs, crop bounds, layout counts, and unsupported historical claims. A metadata-based fallback works without the model.
+4. **Render:** Pillow renders a wide work full bleed with only a very mild crop. Other proportions remain whole on a subdued color matte derived from the artwork, with a thin edge to separate the original from its surround. Captions go in a side or lower matte band if they fit; otherwise placement evaluates four image corners and adds a localized gradient when needed. Two-work, three-work, and same-work detail templates remain available when the artwork limit is raised.
+5. **Queue and show:** PNGs and decisions are stored before display. `next` sets a cached image through the wallpaper adapter, updates the lock screen, and records history and feedback in SQLite.
+
+Source interfaces, desktop backends, and the renderer are separate modules so additional museums or display tools can be added without changing the queue and CLI.
+
+## Current scope
+
+This is the first vertical slice. ArtIC is the only museum adapter. Crop safety combines the local vision model with conservative geometry and local image-detail heuristics; there is no dedicated face detector or embedding model yet. Public lock-screen filtering uses metadata keywords. The renderer supports one, two, or three works, including a magnified detail of one work. More sources, stronger visual understanding, and learned image similarity are natural next steps.
+
+## Development
+
+The tests are end-to-end scenarios that drive the CLI and the gallery server in a temporary home. Fake `dms` and `systemctl` commands and a local fake model server stand in for the desktop and Ollama, so no network, model, or graphical session is needed:
+
+```bash
+bash scripts/check
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and module ownership.
+`AGENTS.md` gives coding agents the same project contracts and check command.
+
+The project is MIT licensed. Museum images retain their own rights metadata and source URL; only ArtIC records explicitly marked public domain are admitted by the current adapter. See [ArtIC API and IIIF documentation](https://api.artic.edu/docs/) for their current usage guidance.

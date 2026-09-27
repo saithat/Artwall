@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Artwall · Your collection</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="Artwall home"><span class="brand-mark">A<span class="brand-dot">.</span></span><span>ARTWALL</span></a>
+    <nav aria-label="Sections"><a href="#collection">Collection</a><a href="#settings">Settings</a></nav>
+    <span class="local-badge"><span class="status-dot"></span> LOCAL CURATOR</span>
+  </header>
+
+  <main>
+    <div class="page-intro"><div><p class="eyebrow">YOUR PERSONAL MUSEUM</p><h1>Art for living with.</h1><p class="intro-copy">A changing collection of real works, selected for your wall.</p></div><button class="text-button" id="refreshButton" type="button">↻ &nbsp; Refresh gallery</button></div>
+
+    <div class="top-grid">
+      <section class="now-section" aria-labelledby="nowTitle">
+        <div class="section-top"><p class="eyebrow">ON YOUR WALL</p><h2 id="nowTitle">Current work</h2></div>
+        <div id="current" class="current-slot"><div class="empty-state">Loading your collection…</div></div>
+      </section>
+
+      <aside class="settings-panel" id="settings" aria-labelledby="settingsTitle">
+        <div class="section-top"><p class="eyebrow">MAKE IT YOURS</p><h2 id="settingsTitle">Curator settings</h2></div>
+        <form id="settingsForm">
+          <label class="field-label" for="interval">Change wallpaper every</label>
+          <div class="number-field"><input id="interval" name="interval" type="number" min="15" max="1440" step="1" required><span>minutes</span></div>
+          <p class="field-note">Give each work enough time to be seen.</p>
+
+          <label class="field-label" for="model">Local Ollama model</label>
+          <input id="model" name="model" type="text" list="modelOptions" spellcheck="false" autocomplete="off" required>
+          <datalist id="modelOptions"></datalist>
+          <p class="field-note" id="modelHelp">Choose a local Ollama model with vision support.</p>
+
+          <fieldset class="count-control"><legend class="field-label">Works on one wallpaper</legend><div class="segmented">
+            <label><input type="radio" name="count" value="1"><span>One</span></label>
+            <label><input type="radio" name="count" value="2"><span>Up to two</span></label>
+            <label><input type="radio" name="count" value="3"><span>Up to three</span></label>
+          </div></fieldset>
+          <p class="field-note">One artwork lets the image and its quiet surroundings breathe.</p>
+          <button class="primary-button" type="submit">Save settings <span aria-hidden="true">→</span></button>
+        </form>
+        <div class="panel-rule"></div>
+        <section class="blacklist-section" aria-labelledby="blacklistTitle"><p class="eyebrow">EXCLUSIONS</p><h3 id="blacklistTitle">Keep these out</h3>
+          <form id="artistForm" class="inline-form"><label class="sr-only" for="artistInput">Artist to exclude</label><input id="artistInput" list="artistOptions" placeholder="Search an artist" autocomplete="off" required><datalist id="artistOptions"></datalist><button type="submit" aria-label="Exclude artist">Add</button></form>
+          <div id="blacklistedArtists" class="blacklist-list"></div>
+          <form id="workForm" class="inline-form"><label class="sr-only" for="workInput">Artwork to exclude</label><input id="workInput" list="artworkOptions" placeholder="Search an artwork" autocomplete="off" required><datalist id="artworkOptions"></datalist><button type="submit" aria-label="Exclude artwork">Add</button></form>
+          <div id="blacklistedWorks" class="blacklist-list"></div>
+        </section>
+      </aside>
+    </div>
+
+    <section class="collection-section" id="collection" aria-labelledby="queueTitle"><div class="section-heading"><div><p class="eyebrow">READY TO SHOW</p><h2 id="queueTitle">Coming next <span class="count" id="queueCount"></span></h2></div><p>Prepared locally for instant rotation.</p></div><div class="card-grid" id="queue"></div></section>
+    <section class="collection-section history-section" aria-labelledby="historyTitle"><div class="section-heading"><div><p class="eyebrow">THE ART YOU’VE LIVED WITH</p><h2 id="historyTitle">Recently seen</h2></div><p>Your impressions help shape what appears next.</p></div><div class="card-grid" id="history"></div></section>
+    <footer>ARTWALL <span>·</span> REAL ART, QUIETLY CURATED</footer>
+  </main>
+
+  <dialog id="detailDialog" aria-labelledby="detailTitle"><div class="dialog-shell"><button id="closeDialog" class="dialog-close" type="button" aria-label="Close details">×</button><div id="detailContent"></div></div></dialog>
+  <div id="notice" class="notice" role="status" aria-live="polite"></div>
+</body>
+</html>
