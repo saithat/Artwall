@@ -201,7 +201,12 @@ def cmd_curate(args: argparse.Namespace, settings: Settings) -> None:
 
 def cmd_next(args: argparse.Namespace, settings: Settings) -> None:
     with _database() as db:
-        _announce(db, rotation.advance(db, settings, apply=not args.no_apply), applied=not args.no_apply)
+        composition = (rotation.advance_if_due(db, settings, apply=not args.no_apply)
+                       if args.if_due else rotation.advance(db, settings, apply=not args.no_apply))
+        if composition:
+            _announce(db, composition, applied=not args.no_apply)
+        else:
+            print("Rotation interval has not elapsed; wallpaper unchanged.")
 
 
 def cmd_previous(args: argparse.Namespace, settings: Settings) -> None:
@@ -371,6 +376,8 @@ def build_parser() -> argparse.ArgumentParser:
         command.set_defaults(handler=handler)
         if name in ("next", "previous", "skip", "dislike"):
             command.add_argument("--no-apply", action="store_true", help="update local state without desktop IPC")
+        if name == "next":
+            command.add_argument("--if-due", action="store_true", help="advance only after the rotation interval has elapsed")
         if name == "info":
             command.add_argument("--json", action="store_true")
         if name == "open":

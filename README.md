@@ -66,9 +66,9 @@ After the first wallpaper works in the Niri session:
 artwall install-timers
 ```
 
-This writes five `systemd --user` units under `~/.config/systemd/user/` and enables a login service plus the rotation and daily curation timers. The login service advances one cached wallpaper when the graphical session starts. Rotation then shows another every two hours by default. Daily curation refreshes ArtIC metadata and renders the next queue. The interface updates an installed rotation timer when you change the interval. If you edit `[rotation].interval_minutes` by hand, run `artwall install-timers` again. `artwall install-timers --no-enable` writes the units without enabling them.
+This writes five `systemd --user` units under `~/.config/systemd/user/` and enables a login service plus the rotation and daily curation timers. The login service advances one cached wallpaper when the time since the last successful wallpaper change exceeds the configured interval. Rotation then shows another every two hours by default. Daily curation refreshes ArtIC metadata and renders the next queue. The interface updates an installed rotation timer when you change the interval. If you edit `[rotation].interval_minutes` by hand, run `artwall install-timers` again. `artwall install-timers --no-enable` writes the units without enabling them.
 
-The rotation timer starts with the graphical session and does not catch up missed intervals while the computer is off. At login, Artwall advances once; each later timer run also advances once. A failed desktop update leaves that work queued for the next attempt. The login service retries briefly if the wallpaper backend is still starting.
+The rotation timer starts with the graphical session and does not catch up missed intervals while the computer is off. At login, Artwall keeps the current wallpaper if it changed within the interval; after a longer gap it advances once. Each later timer run also advances once. A failed desktop update leaves that work queued for the next attempt. The login service retries briefly if the wallpaper backend is still starting. Run `artwall next --if-due` to apply the same check manually.
 
 ## Configuration
 

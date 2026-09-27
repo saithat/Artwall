@@ -20,7 +20,7 @@ def unit_contents(settings: Settings, executable: str) -> dict[str, str]:
         raise ValueError("Systemd executable path may not contain spaces")
     return {
         "artwall-login.service": f"""[Unit]
-Description=Advance Artwall once when the graphical session starts
+Description=Advance Artwall at login when rotation is due
 PartOf=graphical-session.target
 After=graphical-session.target
 StartLimitIntervalSec=2min
@@ -28,7 +28,7 @@ StartLimitBurst=12
 
 [Service]
 Type=oneshot
-ExecStart={executable} next
+ExecStart={executable} next --if-due
 Restart=on-failure
 RestartSec=5s
 

@@ -2,7 +2,6 @@
 
 import json
 from pathlib import Path
-import time
 from unittest.mock import patch
 
 from PIL import Image
@@ -79,7 +78,7 @@ class CliTests(HomeTest):
         units = self.root / "config" / "systemd" / "user"
         login = (units / "artwall-login.service").read_text()
         timer = (units / "artwall-rotate.timer").read_text()
-        self.assertIn(f"ExecStart={(self.root / 'bin' / 'artwall').resolve()} next", login)
+        self.assertIn(f"ExecStart={(self.root / 'bin' / 'artwall').resolve()} next --if-due", login)
         self.assertIn("WantedBy=graphical-session.target", login)
         self.assertIn("Restart=on-failure", login)
         self.assertIn("OnActiveSec=120min", timer)
@@ -94,20 +93,29 @@ class CliTests(HomeTest):
                                            "systemctl --user restart artwall-rotate.timer",
                                            "systemctl --user enable artwall-login.service"])
 
-        self.cli("next")
+        self.cli("next", "--if-due")
         self.desktop_down.touch()
         with self.assertLogs("artwall", level="ERROR"):
             self.cli("next", status=1)
         with self.database() as db:
             self.assertEqual(db.get_current().id, "first")
+            shown_at = db.get_current().shown_at
             self.assertEqual([item.id for item in db.list_compositions(only_unshown=True)], ["second", "third"])
         current = self.root / "cache" / "artwall" / "current.json"
         self.assertEqual(json.loads(current.read_text())["id"], "first")
         self.desktop_down.unlink()
-        # The login service invokes `next` once after a long gap and a new database connection.
-        with patch("artwall.storage.time.time", return_value=time.time() + 7 * 86400):
-            self.cli("next")
+        commands = self.commands()
+        for elapsed in (120 * 60 - 1, 120 * 60):
+            with patch("artwall.rotation.time.time", return_value=shown_at + elapsed):
+                self.assertIn("wallpaper unchanged", self.cli("next", "--if-due"))
+            self.assertEqual(self.current_id(), "first")
+            self.assertEqual(self.commands(), commands)
+            self.assertEqual(json.loads(current.read_text())["id"], "first")
+        # A week away results in exactly one change, even after the earlier failed update.
+        with patch("artwall.rotation.time.time", return_value=shown_at + 7 * 86400):
+            self.cli("next", "--if-due")
         self.assertEqual(self.current_id(), "second")
+        self.assertEqual(json.loads(current.read_text())["id"], "second")
         with self.database() as db:
             self.assertEqual([item.id for item in db.list_compositions(only_unshown=True)], ["third"])
         self.cli("next", "--no-apply")

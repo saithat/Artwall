@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
+import time
 from typing import Iterable, Iterator, Literal, get_args
 from uuid import uuid4
 
@@ -137,6 +138,15 @@ def advance(db: Database, settings: Settings, *, apply: bool = True) -> Composit
     if previous and previous.id != composition.id:
         db.set_state("back_stack", json.dumps([*_back_stack(db), previous.id][-200:]))
     return composition
+
+
+def advance_if_due(db: Database, settings: Settings, *, apply: bool = True) -> Composition | None:
+    """At login, advance once only after a full interval since the last successful show."""
+    current = db.get_current()
+    if (current and current.shown_at is not None
+            and time.time() - current.shown_at <= settings.interval_minutes * 60):
+        return None
+    return advance(db, settings, apply=apply)
 
 
 def go_back(db: Database, settings: Settings, *, apply: bool = True) -> Composition:
