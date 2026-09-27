@@ -1,4 +1,4 @@
-"""End-to-end command scenarios in a temporary home with fake desktop commands and model server."""
+"""End-to-end command scenarios in a temporary home with fake desktop commands."""
 
 import json
 from pathlib import Path
@@ -6,12 +6,6 @@ from pathlib import Path
 from PIL import Image
 
 from tests.support import HomeTest
-
-REPAIRED = ("The dense etched lines surround a large arch, while a small figure near the lower edge gives "
-            "the structure a striking sense of scale.")
-COAST = ("The museum describes an illuminated horizon over a vast coastal landscape with a tiny figure "
-         "standing at the edge of a rocky foreground.")
-
 
 class CliTests(HomeTest):
     def current_id(self) -> str | None:
@@ -49,32 +43,6 @@ class CliTests(HomeTest):
         for path in (image, self.root / "again.png"):
             with Image.open(path) as rendered:
                 self.assertEqual(rendered.size, (860, 360))
-
-    def test_local_model_caption_is_repaired_or_replaced_by_museum_text(self):
-        arch = self.artwork("1", (2200, 1000), title="The Gothic Arch", artist="Giovanni Battista Piranesi")
-        requests = self.ollama(
-            {"layout": "single", "primary_artwork_id": arch.id, "artworks": [{"id": arch.id, "crop": None}],
-             "description": "This arch was commissioned for wealthy travelers and later entered a royal collection.",
-             "curator_reason": "strong diagonal composition"},
-            {"description": REPAIRED},
-        )
-        with self.database() as db:
-            db.upsert_artwork(arch)
-        self.cli("curate", "--count", "1")
-        self.assertTrue(requests[0]["messages"][0]["images"])
-        self.assertNotIn("images", requests[1]["messages"][0])
-        self.assertIn("Rejection reason", requests[1]["messages"][0]["content"])
-
-        # With the model unreachable, curation still works from museum metadata.
-        self.configure('[llm]\nbase_url = "http://127.0.0.1:1"\n')
-        with self.database() as db:
-            db.upsert_artwork(self.artwork("2", (2200, 1000), title="Coast", museum_description=COAST))
-        self.cli("curate", "--count", "1")
-        with self.database() as db:
-            first, second = db.list_compositions(only_unshown=True)
-        self.assertEqual((first.artwork_ids, first.decision.description), ([arch.id], REPAIRED))
-        self.assertEqual(second.decision.description, COAST)
-        self.assertIn("Local model unavailable", second.decision.curator_reason)
 
     def test_rotation_skips_unusable_entries_walks_back_and_reuses_the_queue_offline(self):
         arcade, harbor, rejected = (self.artwork(str(i), title=title) for i, title in

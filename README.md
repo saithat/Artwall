@@ -99,11 +99,13 @@ This is the first vertical slice. ArtIC is the only museum adapter. Crop safety 
 
 ## Development
 
-The tests are end-to-end scenarios that drive the CLI and the gallery server in a temporary home. Hypothesis generates settings cases for the gallery API. Fake `dms` and `systemctl` commands and a local fake model server stand in for the desktop and Ollama, so no network, model, or graphical session is needed. Install the test extra (`python -m pip install -e '.[test]'`) before running:
+The default tests are end-to-end scenarios that drive the CLI and gallery server in a temporary home. Hypothesis generates settings cases for the gallery API. Fake `dms` and `systemctl` commands stand in for the desktop; the default check needs no network, model, or graphical session. Install the test extra (`python -m pip install -e '.[test]'`) before running:
 
 ```bash
 bash scripts/check
 ```
+
+To check curation against a running local Ollama and installed vision model, run `bash scripts/check-model`. It uses `qwen3.6:27b` by default; set `ARTWALL_TEST_MODEL` or `ARTWALL_TEST_OLLAMA_URL` for another local setup. This live check is separate from CI.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and module ownership.
 `AGENTS.md` gives coding agents the same project contracts and check command.

@@ -18,6 +18,7 @@ bash scripts/check
 The check script compiles the package and runs the offline test suite, including
 Hypothesis-generated gallery settings cases. CI runs the same command. For a focused test, run
 `python -m unittest tests/test_gui.py -v` (substitute the relevant file).
+Run `bash scripts/check-model` separately to exercise real local Ollama curation.
 
 ## Find the right place to change
 

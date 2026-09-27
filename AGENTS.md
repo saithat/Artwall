@@ -37,10 +37,10 @@ museum facts authoritative, and rotation usable without a network or model.
 - Platform-specific wallpaper, lock-screen, and scheduling behavior belongs
   behind adapters. Do not introduce a Niri or systemd dependency into the
   source, curation, storage, or rendering modules.
-- Tests are end-to-end scenarios through the CLI and gallery server, in a
-  temporary home with fake desktop commands on PATH and a local fake model
-  server (`tests/support.py`). Network, Ollama, and desktop commands are never
-  prerequisites for the suite.
+- Default tests are end-to-end scenarios through the CLI and gallery server,
+  in a temporary home with fake desktop commands on PATH (`tests/support.py`).
+  Network, Ollama, and desktop commands are not prerequisites for `scripts/check`.
+  The explicit `scripts/check-model` uses a real local Ollama vision model.
 
 When changing a contract, update the relevant test and README in the same
 change. Add a new dependency only when its concrete benefit outweighs the

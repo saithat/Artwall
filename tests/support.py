@@ -1,16 +1,14 @@
-"""End-to-end test home: temporary XDG directories, fake desktop commands, and a fake Ollama.
+"""End-to-end test home with temporary XDG directories and fake desktop commands.
 
 Commands on PATH are small shell scripts that log their arguments, so the real
-subprocess and HTTP code runs without touching this machine's desktop, systemd,
-museum API, or model.
+subprocess and HTTP code runs without touching this machine's desktop or systemd.
 """
 
 from __future__ import annotations
 
 import contextlib
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import HTTPServer
 import io
-import json
 import os
 from pathlib import Path
 import tempfile
@@ -30,21 +28,6 @@ _FAKE_COMMAND = """#!/bin/sh
 if [ -e "{down}" ]; then echo "ERROR: no DMS session"; exit 0; fi
 printf '%s\\n' "{name} $*" >> "{log}"
 """
-
-
-class _FakeOllama(BaseHTTPRequestHandler):
-    def do_POST(self) -> None:
-        server: Any = self.server
-        server.requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
-        body = json.dumps({"message": {"content": json.dumps(server.replies.pop(0))}}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *_: object) -> None:
-        pass
 
 
 class HomeTest(unittest.TestCase):
@@ -101,13 +84,6 @@ class HomeTest(unittest.TestCase):
 
         self.addCleanup(stop)
         return f"http://127.0.0.1:{server.server_address[1]}"
-
-    def ollama(self, *replies: object, extra: str = "") -> list[dict[str, Any]]:
-        """Point the config at a local model server that answers with these JSON replies in turn."""
-        server: Any = HTTPServer(("127.0.0.1", 0), _FakeOllama)
-        server.replies, server.requests = list(replies), []
-        self.configure(f'[llm]\nbase_url = "{self.serve(server)}"\n{extra}')
-        return server.requests  # type: ignore[no-any-return]
 
     def artwork(self, source_id: str, size: tuple[int, int] | None = None, **fields: Any) -> Artwork:
         """A public-domain museum record, with a cached JPEG when a size is given."""
