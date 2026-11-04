@@ -5,11 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import colorsys
 from io import BytesIO
+import math
 from pathlib import Path
 import re
 from typing import Mapping, NamedTuple
 
-from PIL import Image, ImageChops, ImageCms, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageStat
+from PIL import Image, ImageChops, ImageCms, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageStat
 
 from artwall.models import ANCHORS, Anchor, Artwork, Crop, CuratorDecision, Layout
 
@@ -37,7 +38,6 @@ class RenderSettings:
     font_title: str | None = None
     font_body: str | None = None
     show_medium: bool = False
-    body_max_lines: int = 6
     # Common centered password area. Corner captions never intentionally enter it.
     lock_ui_region: tuple[float, float, float, float] = (0.34, 0.30, 0.66, 0.76)
 
@@ -183,8 +183,10 @@ def _fit_panel(image: Image.Image, box: Rect, *, explicit_crop: Crop | None,
     # kept quiet; the artwork itself is neither stretched nor blurred.
     scale = min(panel_w / part.width, panel_h / part.height)
     new_size = (max(1, round(part.width * scale)), max(1, round(part.height * scale)))
-    fitted = Image.new("RGB", (panel_w, panel_h), BACKGROUND)
-    fitted.paste(part.resize(new_size, RESAMPLE), ((panel_w - new_size[0]) // 2, (panel_h - new_size[1]) // 2))
+    matte, border = _matte_colors(part)
+    fitted = _ambient_background(part, (panel_w, panel_h), matte)
+    left, top = (panel_w - new_size[0]) // 2, (panel_h - new_size[1]) // 2
+    _mount_artwork(fitted, part, (left, top, left + new_size[0], top + new_size[1]), border)
     return fitted, explicit_crop
 
 
@@ -221,6 +223,38 @@ def _matte_colors(image: Image.Image) -> tuple[RGB, RGB]:
     return (red, green, blue), border
 
 
+def _ambient_background(image: Image.Image, size: tuple[int, int], matte: RGB) -> Image.Image:
+    """Diffuse the work's colors into the surround; never alter the original."""
+    # Work small so even large originals yield a fast, deterministic backdrop.
+    scale = 240 / max(size)
+    small = (max(1, round(size[0] * scale)), max(1, round(size[1] * scale)))
+    colors = ImageOps.fit(image, small, method=RESAMPLE)
+    colors = ImageEnhance.Color(colors).enhance(0.35)
+    colors = colors.filter(ImageFilter.GaussianBlur(max(8, min(small) * 0.16)))
+    colors = Image.blend(Image.new("RGB", small, matte), colors, 0.22)
+    return colors.resize(size, RESAMPLE)
+
+
+def _mount_artwork(canvas: Image.Image, image: Image.Image, box: Rect, border: RGB, *,
+                   add_shadow: bool = True) -> Rect:
+    """Keep a crisp, framed original distinct from the diffuse surround."""
+    fitted = ImageOps.contain(image, (box[2] - box[0], box[3] - box[1]), RESAMPLE)
+    left = box[0] + (box[2] - box[0] - fitted.width) // 2
+    top = box[1] + (box[3] - box[1] - fitted.height) // 2
+    rect = (left, top, left + fitted.width, top + fitted.height)
+    if add_shadow:
+        shadow = Image.new("L", canvas.size)
+        ImageDraw.Draw(shadow).rectangle(rect, fill=110)
+        canvas.paste((12, 13, 13), (0, 0), shadow.filter(ImageFilter.GaussianBlur(max(3, canvas.height * 0.012))))
+    line = max(1, round(canvas.height * 0.0015))
+    ImageDraw.Draw(canvas).rectangle(
+        (left - line, top - line, rect[2] + line - 1, rect[3] + line - 1),
+        outline=border, width=line,
+    )
+    canvas.paste(fitted, (left, top))
+    return rect
+
+
 def _fit_single(image: Image.Image, settings: RenderSettings, explicit_crop: Crop | None,
                 ) -> tuple[Image.Image, Rect, Crop | None, RGB | None]:
     """Fill only for a very mild crop; otherwise keep the complete work."""
@@ -241,7 +275,7 @@ def _fit_single(image: Image.Image, settings: RenderSettings, explicit_crop: Cro
         return filled, (0, 0, settings.width, settings.height), _source_crop(region[:2], crop_box, size), None
 
     matte, border = _matte_colors(image)
-    canvas = Image.new("RGB", (settings.width, settings.height), matte)
+    canvas = _ambient_background(image, (settings.width, settings.height), matte)
     inset = max(2, round(min(settings.width, settings.height) * 0.006))
     scale = min((settings.width - 2 * inset) / image.width,
                 (settings.height - 2 * inset) / image.height)
@@ -254,14 +288,7 @@ def _fit_single(image: Image.Image, settings: RenderSettings, explicit_crop: Cro
         top = (settings.height - fitted_h) // 2
     left = (settings.width - fitted_w) // 2
     box = (left, top, left + fitted_w, top + fitted_h)
-    line_width = max(2, round(inset * 0.35))
-    ImageDraw.Draw(canvas).rectangle(
-        (max(0, left - line_width), max(0, top - line_width),
-         min(settings.width - 1, box[2] + line_width - 1),
-         min(settings.height - 1, box[3] + line_width - 1)),
-        outline=border, width=line_width,
-    )
-    canvas.paste(image.resize((fitted_w, fitted_h), RESAMPLE), (left, top))
+    box = _mount_artwork(canvas, image, box, border)
     return canvas, box, crop, matte
 
 
@@ -273,33 +300,20 @@ def _panels(layout: Layout, ids: list[str], settings: RenderSettings,
         split = round(w * (0.42 if ratios[ids[0]] < 0.95 else 0.69))
         return [(ids[0], (0, 0, split - g // 2, h), False),
                 (ids[0], (split + g // 2, 0, w, h), True)]
-    if layout in ("diptych_50", "diptych_60"):
-        desired = 0.6 if layout == "diptych_60" else 0.5
-        first_ratio, second_ratio = ratios[ids[0]], ratios[ids[1]]
-        desired_left = desired * (w - g) / h
-        desired_right = (1 - desired) * (w - g) / h
-        # Rescue an otherwise very empty panel by giving each original an
-        # amount of width proportional to its shape. The resulting split can
-        # be asymmetric, like an art-book spread, while both works fill height.
-        if min(_retained(first_ratio, desired_left), _retained(second_ratio, desired_right)) < 0.75:
-            desired = max(0.28, min(0.72, first_ratio / (first_ratio + second_ratio)))
-        split = round(w * desired)
-        return [(ids[0], (0, 0, split - g // 2, h), False),
-                (ids[1], (split + g // 2, 0, w, h), False)]
-    if layout == "triptych":
-        item_ratios = [ratios[i] for i in ids]
-        panel_ratio = ((w - 2 * g) / 3) / h
-        if min(_retained(r, panel_ratio) for r in item_ratios) < 0.75:
-            shares = [max(0.20, min(0.50, r / sum(item_ratios))) for r in item_ratios]
-            shares = [share / sum(shares) for share in shares]
-        else:
-            shares = [1 / 3] * 3
-        usable = w - 2 * g
-        first = round(usable * shares[0])
-        second = round(usable * (shares[0] + shares[1]))
-        return [(ids[0], (0, 0, first, h), False),
-                (ids[1], (first + g, 0, second + g, h), False),
-                (ids[2], (second + 2 * g, 0, w, h), False)]
+    if layout in ("diptych_50", "diptych_60", "triptych"):
+        # One aligned row at a common height, with widths following the actual
+        # originals. Fixed slots waste space or crop works of differing shapes.
+        inset = max(2, round(min(w, h) * 0.006))
+        usable = w - 2 * inset - g * (len(ids) - 1)
+        height = max(1, min(h - 2 * inset, int(usable / sum(ratios[i] for i in ids))))
+        widths = [max(1, round(height * ratios[i])) for i in ids]
+        left = (w - sum(widths) - g * (len(ids) - 1)) // 2
+        top = (h - height) // 2
+        panels = []
+        for artwork_id, width in zip(ids, widths):
+            panels.append((artwork_id, (left, top, left + width, top + height), False))
+            left += width + g
+        return panels
     return [(ids[0], (0, 0, w, h), False)]
 
 
@@ -324,18 +338,6 @@ def _text_wrap(draw: ImageDraw.ImageDraw, text: str, font: Font, max_width: int)
         if current:
             lines.append(current)
     return lines
-
-
-def _limit_lines(draw: ImageDraw.ImageDraw, lines: list[str], font: Font,
-                 max_lines: int, max_width: int) -> list[str]:
-    if len(lines) <= max_lines:
-        return lines
-    kept = lines[:max_lines]
-    last = kept[-1].rstrip()
-    while last and draw.textlength(last + "…", font=font) > max_width:
-        last = last[:-1].rstrip()
-    kept[-1] = last + "…"
-    return kept
 
 
 def _display_title(title: str) -> str:
@@ -385,37 +387,55 @@ def _ink_for_region(canvas: Image.Image, rect: Rect) -> bool:
 
 
 def _caption_lines(canvas: Image.Image, decision: CuratorDecision, primary: Artwork,
-                   companions: list[Artwork], settings: RenderSettings) -> tuple[list[_Line], int, int]:
-    title_font = _font(settings.font_title, "NotoSerif", max(23, round(settings.height * 0.024)))
-    meta_font = _font(settings.font_body, "NotoSans", max(17, round(settings.height * 0.015)))
-    body_font = _font(settings.font_body, "NotoSans", max(16, round(settings.height * 0.014)))
+                   companions: list[Artwork], settings: RenderSettings, *,
+                   font_scale: float = 1) -> tuple[list[_Line], int, int]:
+    """Wrap complete caption fields, using the same glyph bounds as drawing."""
+    title_font = _font(settings.font_title, "NotoSerif", max(1, round(max(23, settings.height * 0.024) * font_scale)))
+    meta_font = _font(settings.font_body, "NotoSans", max(1, round(max(17, settings.height * 0.015) * font_scale)))
+    body_font = _font(settings.font_body, "NotoSans", max(1, round(max(16, settings.height * 0.014) * font_scale)))
     draw = ImageDraw.Draw(canvas)
-    width = settings.caption_max_width
+    lines: list[_Line] = []
 
-    def wrapped(text: str, font: Font, max_lines: int) -> list[str]:
-        return _limit_lines(draw, _text_wrap(draw, text, font, width), font, max_lines, width)
+    def append(text: str, font: Font, color: RGB) -> None:
+        wrapped = _text_wrap(draw, text, font, settings.caption_max_width)
+        ink_height = max((draw.textbbox((0, 0), line, font=font, anchor="lt")[3]
+                          for line in wrapped), default=0)
+        spacing = ink_height + max(2, round(font.size * 0.2))
+        lines.extend(_Line(line, font, color, spacing) for line in wrapped)
 
     style, medium_as_style = _context_label(primary)
     meta = " · ".join(x for x in (primary.artist or "Artist unknown", primary.date_display, style) if x)
-    lines = [_Line(line, title_font, PAPER, 39) for line in wrapped(_display_title(primary.title or "Untitled"), title_font, 2)]
-    lines += [_Line(line, meta_font, SECONDARY, 27) for line in wrapped(meta, meta_font, 2)]
+    append(_display_title(primary.title or "Untitled"), title_font, PAPER)
+    append(meta, meta_font, SECONDARY)
     if settings.show_medium and not medium_as_style and primary.medium:
-        lines += [_Line(line, body_font, MUTED, 23) for line in _text_wrap(draw, primary.medium, body_font, width)[:1]]
+        append(primary.medium, body_font, MUTED)
     for companion in companions:
         if companion.title:
-            label = f"With: {_companion_title(companion.title)}"
-            lines += [_Line(line, body_font, SECONDARY, 23) for line in wrapped(label, body_font, 1)]
-    # Museum text is often markup or much longer than a wallpaper can hold.
+            append(f"With: {_companion_title(companion.title)}", body_font, SECONDARY)
     description = " ".join(decision.description.split())
     if description:
-        available = settings.height - 2 * settings.caption_margin - sum(line.spacing for line in lines)
-        max_body_lines = max(0, min(settings.body_max_lines, (available - 13) // 25))
-        body_lines = wrapped(description, body_font, max_body_lines) if max_body_lines else []
-        if body_lines:
-            lines.append(_Line("", body_font, PAPER, 13))
-            lines += [_Line(line, body_font, PAPER, 25) for line in body_lines]
-    max_w = max((int(draw.textlength(line.text, font=line.font)) for line in lines), default=0)
-    return lines, max_w, sum(line.spacing for line in lines)
+        lines.append(_Line("", body_font, PAPER, max(3, round(body_font.size * 0.65))))
+        append(description, body_font, PAPER)
+    max_w = max((math.ceil(draw.textbbox((0, 0), line.text, font=line.font, anchor="lt")[2])
+                 for line in lines), default=0)
+    return lines, max_w + 2, sum(line.spacing for line in lines) + 2
+
+
+def _fit_caption(canvas: Image.Image, decision: CuratorDecision, primary: Artwork,
+                 companions: list[Artwork], settings: RenderSettings) -> tuple[list[_Line], int, int]:
+    """Prefer the requested width, widening or reducing type only to keep all text on screen."""
+    available_width = settings.width - 2 * settings.caption_margin
+    available_height = settings.height - 2 * settings.caption_margin
+    widths = dict.fromkeys((settings.caption_max_width, min(900, available_width), available_width))
+    for step in range(10):
+        scale = (10 - step) / 10
+        for width in widths:
+            lines, content_w, content_h = _caption_lines(
+                canvas, decision, primary, companions, replace(settings, caption_max_width=width - 2),
+                font_scale=scale)
+            if content_w <= available_width and content_h <= available_height:
+                return lines, content_w, content_h
+    raise ValueError("Caption cannot fit inside the configured display")
 
 
 def _anchor_rect(anchor: Anchor, content_w: int, content_h: int, settings: RenderSettings) -> Rect:
@@ -475,8 +495,7 @@ def _matte_caption(canvas: Image.Image, artwork_rect: Rect, decision: CuratorDec
     if left > edge_pad * 2:
         side_width = left - edge_pad - outer_pad
         if side_width >= 320:
-            local = replace(settings, caption_max_width=min(settings.caption_max_width, side_width),
-                            body_max_lines=10)
+            local = replace(settings, caption_max_width=min(settings.caption_max_width, side_width))
             lines, content_w, content_h = _caption_lines(canvas, decision, primary, companions, local)
             if content_h + 2 * outer_pad <= settings.height:
                 side = "left" if requested.endswith("left") else "right"
@@ -492,8 +511,7 @@ def _matte_caption(canvas: Image.Image, artwork_rect: Rect, decision: CuratorDec
     lower_height = settings.height - bottom
     if lower_height > 0:
         local = replace(settings, caption_max_width=min(max(800, settings.caption_max_width),
-                                                        settings.width - 2 * outer_pad),
-                        body_max_lines=8)
+                                                        settings.width - 2 * outer_pad))
         lines, content_w, content_h = _caption_lines(canvas, decision, primary, companions, local)
         if lower_height >= content_h + 2 * edge_pad:
             on_right = requested.endswith("right")
@@ -510,6 +528,8 @@ def render_wallpaper(decision: CuratorDecision, artworks: Mapping[str, Artwork],
     settings = settings or RenderSettings()
     if settings.width < 320 or settings.height < 240:
         raise ValueError("Display dimensions are too small")
+    settings = replace(settings, caption_margin=min(settings.caption_margin, settings.height // 12,
+                                                    settings.width // 8))
     settings = replace(settings, caption_max_width=min(decision.caption_max_width_px,
                                                        settings.width - 2 * settings.caption_margin))
     ids = decision.artwork_ids
@@ -530,6 +550,24 @@ def render_wallpaper(decision: CuratorDecision, artworks: Mapping[str, Artwork],
         fitted, artwork_rect, crops[artwork_id], matte_color = _fit_single(
             images[artwork_id], settings, entry_crops[artwork_id])
         canvas.paste(fitted, (0, 0))
+    elif decision.layout != "artwork_detail":
+        matte_color, _ = _matte_colors(images[decision.primary_artwork_id])
+        canvas = _ambient_background(images[decision.primary_artwork_id], canvas.size, matte_color)
+        # Draw every shadow before any original, so a neighboring panel's
+        # shadow can never darken artwork pixels that have already been pasted.
+        shadow = Image.new("L", canvas.size)
+        shadow_draw = ImageDraw.Draw(shadow)
+        for _, box, _ in panels:
+            shadow_draw.rectangle(box, fill=110)
+        canvas.paste((12, 13, 13), (0, 0), shadow.filter(ImageFilter.GaussianBlur(max(3, canvas.height * 0.012))))
+        mounted = []
+        for artwork_id, box, _ in panels:
+            image = images[artwork_id]
+            _, border = _matte_colors(image)
+            mounted.append(_mount_artwork(canvas, image, box, border, add_shadow=False))
+            crops[artwork_id] = None  # Whole originals, including their paper margins.
+        artwork_rect = (min(box[0] for box in mounted), min(box[1] for box in mounted),
+                        max(box[2] for box in mounted), max(box[3] for box in mounted))
     else:
         for artwork_id, box, detail in panels:
             image = images[artwork_id]
@@ -561,7 +599,7 @@ def render_wallpaper(decision: CuratorDecision, artworks: Mapping[str, Artwork],
         dark_ink = False
     else:
         placement = "overlay"
-        lines, content_w, content_h = _caption_lines(canvas, decision, primary, companions, settings)
+        lines, content_w, content_h = _fit_caption(canvas, decision, primary, companions, settings)
         scores = {option: _score_anchor(canvas, _anchor_rect(option, content_w, content_h, settings), settings)
                   for option in ANCHORS}
         scores[decision.caption_anchor] -= 11  # Respect the model when the region is comparable.
@@ -578,11 +616,11 @@ def render_wallpaper(decision: CuratorDecision, artworks: Mapping[str, Artwork],
         if line:
             if dark_ink:
                 ink = (40, 40, 40) if color == PAPER else (60, 56, 54)
-                draw.text((x + 1, y + 1), line, font=font, fill=(245, 240, 225))
-                draw.text((x, y), line, font=font, fill=ink)
+                draw.text((x + 1, y + 1), line, font=font, fill=(245, 240, 225), anchor="lt")
+                draw.text((x, y), line, font=font, fill=ink, anchor="lt")
             else:
-                draw.text((x + 1, y + 2), line, font=font, fill=(16, 17, 17))
-                draw.text((x, y), line, font=font, fill=color)
+                draw.text((x + 1, y + 2), line, font=font, fill=(16, 17, 17), anchor="lt")
+                draw.text((x, y), line, font=font, fill=color, anchor="lt")
         y += spacing
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)

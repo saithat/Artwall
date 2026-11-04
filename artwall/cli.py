@@ -117,7 +117,7 @@ def _render(db: Database, decision: CuratorDecision, settings: Settings, output:
         width=settings.width, height=settings.height, show_medium=settings.show_medium))
 
 
-def _queue(db: Database, decision: CuratorDecision, settings: Settings) -> Composition:
+def _queue(db: Database, decision: CuratorDecision, settings: Settings, *, queue_priority: float = 0) -> Composition:
     """Render a decision and store it, with a JSON sidecar, before it is ever shown."""
     identifier = uuid4().hex
     output = data_dir() / "compositions" / f"{identifier}.png"
@@ -126,7 +126,7 @@ def _queue(db: Database, decision: CuratorDecision, settings: Settings) -> Compo
     composition = Composition(identifier, decision, str(rendered.path),
                               render={**details, "width": settings.width, "height": settings.height})
     write_atomic(output.with_suffix(".json"), json.dumps(composition.to_dict(), ensure_ascii=False, indent=2) + "\n")
-    db.add_composition(composition)
+    db.add_composition(composition, queue_priority=queue_priority)
     return composition
 
 
@@ -180,6 +180,7 @@ def cmd_curate(args: argparse.Namespace, settings: Settings) -> None:
     curator = (OllamaCurator(settings.model, settings.ollama_url, description_words=settings.caption_words)
                if settings.use_local_model and not args.offline else None)
     created = 0
+    queue_priority = time.time() if args.next else 0
     with _database() as db:
         source = ArticSource(db)
         reserved = {artwork_id for composition in rotation.upcoming(db, settings)
@@ -190,11 +191,12 @@ def cmd_curate(args: argparse.Namespace, settings: Settings) -> None:
             if not pool:
                 break
             decision = choose_composition(pool, taste, max_artworks=settings.max_artworks,
-                                          screen_ratio=settings.width / settings.height, curator=curator)
-            composition = _queue(db, decision, settings)
+                                          screen_ratio=settings.width / settings.height, curator=curator,
+                                          feedback=db.curation_feedback())
+            composition = _queue(db, decision, settings, queue_priority=queue_priority)
             reserved.update(composition.artwork_ids)
             created += 1
-            print(f"Queued {composition.id[:8]}: {_label(db, composition)}")
+            print(f"Queued {composition.id[:8]}: {_label(db, composition)}", flush=True)
     if not created:
         raise RuntimeError("No new composition could be made. Run 'artwall refresh' or inspect cached image failures.")
 
@@ -393,6 +395,7 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "curate":
             command.add_argument("--count", type=int)
             command.add_argument("--offline", action="store_true", help="use local deterministic curator")
+            command.add_argument("--next", action="store_true", help="place new wallpapers ahead of the existing queue")
         if name in ("more-from-artist", "less-from-artist", "blacklist-artist"):
             command.add_argument("artist", nargs="?", help="defaults to the current primary artist")
         if name == "install-timers":

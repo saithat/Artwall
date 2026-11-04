@@ -9,6 +9,23 @@ from tests.support import HomeTest
 
 
 class LiveOllamaTests(HomeTest):
+    def test_curates_a_pair_with_supported_layout_names(self):
+        model = os.environ.get("ARTWALL_TEST_MODEL", "qwen3.6:27b")
+        base_url = os.environ.get("ARTWALL_TEST_OLLAMA_URL", "http://127.0.0.1:11434")
+        self.configure(f"[llm]\nmodel = {json.dumps(model)}\nbase_url = {json.dumps(base_url)}\n"
+                       "[curation]\nmax_artworks = 2\n")
+        with self.database() as db:
+            for identifier, title in (("live-left", "Mountain Study"), ("live-right", "Valley Study")):
+                work = self.artwork(identifier, (1600, 1450), title=title, artist="A Landscape Artist",
+                                    subject_tags=["mountains"])
+                db.upsert_artwork(work)
+        self.cli("curate", "--count", "1")
+        with self.database() as db:
+            (composition,) = db.list_compositions()
+        self.assertEqual(set(composition.artwork_ids), {"artic:live-left", "artic:live-right"})
+        self.assertIn(composition.decision.layout, ("diptych_50", "diptych_60"))
+        self.assertNotIn("Local model unavailable or invalid", composition.decision.curator_reason)
+
     def test_curates_a_cached_artwork_with_the_real_model(self):
         model = os.environ.get("ARTWALL_TEST_MODEL", "qwen3.6:27b")
         base_url = os.environ.get("ARTWALL_TEST_OLLAMA_URL", "http://127.0.0.1:11434")

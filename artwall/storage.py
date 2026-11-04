@@ -13,7 +13,7 @@ from artwall.models import Artwork, Composition
 
 
 LOG = logging.getLogger(__name__)
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 FeedbackKind = Literal["like", "dislike", "favorite", "skip", "blacklist"]
 TargetType = Literal["composition", "artwork"]
 _PUT_STATE = ("INSERT INTO state(key, value) VALUES (?, ?) "
@@ -119,6 +119,18 @@ class Database:
                     PRAGMA user_version = 2;
                     """
                 )
+            version = 2
+        if version == 2:
+            with self.connection:
+                self.connection.executescript(
+                    """
+                    ALTER TABLE compositions ADD COLUMN queue_priority REAL NOT NULL DEFAULT 0;
+                    DROP INDEX IF EXISTS idx_compositions_queue;
+                    CREATE INDEX idx_compositions_queue
+                        ON compositions(shown_at, queue_priority DESC, created_at);
+                    PRAGMA user_version = 3;
+                    """
+                )
 
     def close(self) -> None:
         self.connection.close()
@@ -160,12 +172,13 @@ class Database:
     def count_artworks(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM artworks").fetchone()[0])
 
-    def add_composition(self, composition: Composition) -> None:
+    def add_composition(self, composition: Composition, *, queue_priority: float = 0) -> None:
         """Insert a composition; artwork IDs are indexed for repeat avoidance."""
         with self.connection:
             self.connection.execute(
-                "INSERT INTO compositions(id, payload, created_at) VALUES (?, ?, ?)",
-                (composition.id, json.dumps(composition.to_dict(), ensure_ascii=False), composition.created_at),
+                "INSERT INTO compositions(id, payload, created_at, queue_priority) VALUES (?, ?, ?, ?)",
+                (composition.id, json.dumps(composition.to_dict(), ensure_ascii=False),
+                 composition.created_at, queue_priority),
             )
             self.connection.executemany(
                 "INSERT INTO composition_artworks(composition_id, artwork_id, position) VALUES (?, ?, ?)",
@@ -190,7 +203,8 @@ class Database:
 
     def list_compositions(self, *, only_unshown: bool = False, limit: int = 1000) -> list[Composition]:
         if only_unshown:
-            query = "SELECT * FROM compositions WHERE shown_at IS NULL ORDER BY created_at, id LIMIT ?"
+            query = ("SELECT * FROM compositions WHERE shown_at IS NULL "
+                     "ORDER BY queue_priority DESC, created_at, id LIMIT ?")
         else:
             query = "SELECT * FROM compositions ORDER BY created_at DESC, id LIMIT ?"
         return self._compositions(self.connection.execute(query, (limit,)))
@@ -292,6 +306,26 @@ class Database:
             "SELECT comment FROM composition_comments WHERE composition_id=?", (composition_id,)
         ).fetchone()
         return str(row["comment"]) if row else ""
+
+    def curation_feedback(self, *, limit: int = 8) -> list[dict[str, Any]]:
+        """Recent private impressions, with enough context to guide the curator."""
+        rows = self.connection.execute(
+            """SELECT c.*, n.comment FROM composition_comments n
+               JOIN compositions c ON c.id=n.composition_id
+               ORDER BY n.updated_at DESC, c.id LIMIT ?""", (limit,),
+        )
+        result = []
+        for row in rows:
+            compositions = self._compositions([row])
+            if not compositions:
+                continue
+            composition = compositions[0]
+            works = [work for i in composition.artwork_ids if (work := self.get_artwork(i))]
+            result.append({"layout": composition.decision.layout,
+                           "works": [{"title": work.title[:140], "artist": (work.artist or "")[:100]}
+                                     for work in works],
+                           "comment": str(row["comment"])[:800]})
+        return result
 
     def set_artwork_blacklisted(self, artwork_id: str, enabled: bool = True) -> None:
         if self.get_artwork(artwork_id) is None:

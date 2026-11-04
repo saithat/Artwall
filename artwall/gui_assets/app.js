@@ -6,6 +6,8 @@ let selectedId = null;
 let artworkChoices = new Map();
 let noticeTimer = null;
 let feedbackPending = false;
+let preparationTimer = null;
+const commentDrafts = new Map();
 
 const $ = (id) => document.getElementById(id);
 
@@ -112,6 +114,45 @@ function openDetails(record) {
   $("detailDialog").showModal();
 }
 
+function commentForm(record, location) {
+  const form = node("form", "comment-form" + (location === "current" ? " current-feedback" : ""));
+  const inputId = `${location}CommentInput`;
+  const label = node("label", "field-label", "Feedback for the curator");
+  label.htmlFor = inputId;
+  const text = node("textarea");
+  text.id = inputId;
+  text.dataset.compositionId = record.id;
+  text.maxLength = 5000;
+  text.rows = 3;
+  text.placeholder = "Too much empty space? An awkward pairing? Tell the curator what works and what to change.";
+  text.value = commentDrafts.get(record.id) ?? record.comment ?? "";
+  const help = node("p", "field-note", "Saved on this device. Your local model uses this feedback when preparing future wallpapers.");
+  help.id = `${inputId}Help`;
+  text.setAttribute("aria-describedby", help.id);
+  text.addEventListener("input", () => {
+    commentDrafts.set(record.id, text.value);
+    document.querySelectorAll("textarea[data-composition-id]").forEach((other) => {
+      if (other !== text && other.dataset.compositionId === record.id) other.value = text.value;
+    });
+  });
+  const save = node("button", "primary-button", "Save feedback →");
+  save.type = "submit";
+  form.append(label, text, help, save);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    save.disabled = true;
+    const submitted = text.value;
+    try {
+      const response = await post("/api/comment", { id: record.id, comment: submitted });
+      if (commentDrafts.get(record.id) === submitted) commentDrafts.delete(record.id);
+      await reload();
+      showNotice(response.notice);
+    } catch (error) { showNotice(error.message, true); }
+    finally { save.disabled = false; }
+  });
+  return form;
+}
+
 function renderCurrent() {
   const slot = $("current");
   clear(slot);
@@ -138,10 +179,11 @@ function renderCurrent() {
   controls.append(feedbackGroup(record));
   meta.append(information, controls);
   slot.append(meta);
-  const details = node("button", "detail-link", "View details & add a note ↗");
+  const details = node("button", "detail-link", "View artwork details ↗");
   details.type = "button";
   details.addEventListener("click", () => openDetails(record));
   slot.append(details);
+  slot.append(commentForm(record, "current"));
 }
 
 function renderCards(records, targetId, emptyMessage) {
@@ -164,7 +206,7 @@ function renderCards(records, targetId, emptyMessage) {
     body.append(node("p", "art-card-meta", [record.artist, record.date].filter(Boolean).join(" · ")));
     const footer = node("div", "art-card-footer");
     footer.append(feedbackGroup(record));
-    const detail = node("button", "detail-link", "Details ↗");
+    const detail = node("button", "detail-link", "Details & feedback ↗");
     detail.type = "button";
     detail.addEventListener("click", () => openDetails(record));
     footer.append(detail);
@@ -218,26 +260,7 @@ function renderDetails(record) {
   const reactions = node("div", "dialog-feedback");
   for (const kind of ["like", "dislike", "favorite"]) reactions.append(reactionButton(record, kind, false));
   body.append(reactions);
-  const form = node("form", "comment-form");
-  const label = node("label", "field-label", "A note to remember this work by");
-  label.htmlFor = "commentInput";
-  const text = node("textarea");
-  text.id = "commentInput";
-  text.maxLength = 5000;
-  text.placeholder = "What caught your eye? What would you like to remember?";
-  text.value = record.comment || "";
-  const save = node("button", "primary-button", "Save note →");
-  save.type = "submit";
-  form.append(label, text, save);
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    try {
-      const response = await post("/api/comment", { id: record.id, comment: text.value });
-      await reload();
-      showNotice(response.notice);
-    } catch (error) { showNotice(error.message, true); }
-  });
-  body.append(form);
+  body.append(commentForm(record, "detail"));
   content.append(body);
 }
 
@@ -306,12 +329,33 @@ function renderSettings() {
 function render() {
   renderCurrent();
   $("queueCount").textContent = `(${gallery.queued.length})`;
-  renderCards(gallery.queued, "queue", "No upcoming compositions. Run artwall curate to prepare more.");
+  renderCards(gallery.queued, "queue", "No upcoming compositions. Choose Prepare new wallpapers to add some.");
   renderCards(gallery.history, "history", "Your recently shown works will appear here.");
   renderSettings();
+  renderPreparation(gallery.preparation);
   if ($("detailDialog").open && selectedId) {
     const record = findRecord(selectedId);
     if (record) renderDetails(record);
+  }
+}
+
+function renderPreparation(preparation) {
+  clearTimeout(preparationTimer);
+  const running = preparation.status === "running";
+  $("prepareButton").disabled = running;
+  $("prepareButton").textContent = running ? "Preparing…" : "Prepare new wallpapers";
+  $("preparationStatus").textContent = preparation.message;
+  if (running) preparationTimer = setTimeout(pollPreparation, 3000);
+}
+
+async function pollPreparation() {
+  try {
+    const preparation = await readResponse(await fetch("/api/preparation", { cache: "no-store" }));
+    renderPreparation(preparation);
+    if (preparation.status !== "running") await reload();
+  } catch (error) {
+    $("preparationStatus").textContent = "Unable to check progress. Reconnecting…";
+    preparationTimer = setTimeout(pollPreparation, 5000);
   }
 }
 
@@ -364,6 +408,17 @@ $("workForm").addEventListener("submit", async (event) => {
 $("refreshButton").addEventListener("click", async () => {
   try { await reload(); showNotice("Gallery is up to date"); }
   catch (error) { showNotice(error.message, true); }
+});
+$("prepareButton").addEventListener("click", async () => {
+  $("prepareButton").disabled = true;
+  try {
+    const response = await post("/api/curate", {});
+    await pollPreparation();
+    showNotice(response.notice);
+  } catch (error) {
+    $("prepareButton").disabled = false;
+    showNotice(error.message, true);
+  }
 });
 $("closeDialog").addEventListener("click", () => $("detailDialog").close());
 $("detailDialog").addEventListener("click", (event) => {

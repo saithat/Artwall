@@ -91,7 +91,9 @@ def _jpeg_size(path: Path) -> tuple[int, int]:
             if image.format != "JPEG":
                 raise SourceError(f"{path.name} is not a JPEG")
             size = image.size
-            image.verify()
+            # JPEG verify() only checks the header. Decode the pixels as the
+            # renderer will, so a truncated download cannot poison a batch.
+            image.load()
     except (UnidentifiedImageError, OSError) as exc:
         raise SourceError(f"{path.name} is unreadable: {exc}") from exc
     return size

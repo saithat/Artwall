@@ -1,14 +1,17 @@
 """End-to-end gallery scenarios over real loopback HTTP."""
 
 import json
+import time
 from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from unittest.mock import patch
 
 from hypothesis import example, given, settings, strategies as st
 
 from artwall.config import config_path, data_dir, database_path, load_config
 from artwall.gui import GuiContext, create_server
+from artwall.models import CuratorDecision, DecisionArtwork
 from artwall.systemd import user_unit_dir
 from tests.support import HomeTest
 
@@ -56,6 +59,58 @@ class GalleryTests(HomeTest):
     def score(self) -> int:
         with self.database() as db:
             return db.get_artist_preference("A Painter").score
+
+    def wait_for_preparation(self) -> dict[str, Any]:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            status, body = self.call("/api/preparation")
+            self.assertEqual(status, 200)
+            preparation = json.loads(body)
+            if preparation["status"] != "running":
+                return preparation
+            time.sleep(0.05)
+        self.fail("Gallery preparation did not finish")
+
+    def test_prepare_new_layouts_goes_ahead_of_old_queue_and_preserves_history(self):
+        self.config_file.write_text(self.config.replace("[llm]\n", "[llm]\nenabled = false\n")
+                                    + "\n[curation]\nmax_artworks = 2\n")
+        with self.database() as db:
+            for index in range(6):
+                db.upsert_artwork(self.artwork(str(100 + index), (1600, 1450),
+                                              artist="An Etcher", subject_tags=["mountains"]))
+            db.set_comment("current", "Keep the original paper margins.")
+            db.set_feedback("current", "favorite")
+            # Upgrade an older queue without losing its order or preferences.
+            db.connection.execute("DROP INDEX idx_compositions_queue")
+            db.connection.execute("ALTER TABLE compositions DROP COLUMN queue_priority")
+            db.connection.execute("PRAGMA user_version = 2")
+            db.connection.commit()
+        self.assertIn("Preparing", self.post("/api/curate", {}))
+        preparation = self.wait_for_preparation()
+        self.assertEqual((preparation["status"], preparation["prepared"]), ("ready", 3), preparation)
+        state = self.state()
+        self.assertEqual(state["current"]["id"], "current")
+        self.assertEqual(state["current"]["comment"], "Keep the original paper margins.")
+        self.assertTrue(state["current"]["feedback"]["favorite"])
+        self.assertEqual(len(state["queued"]), 4)
+        self.assertEqual(state["queued"][-1]["id"], "queued")
+        with self.database() as db:
+            new = db.list_compositions(only_unshown=True)[:3]
+            self.assertTrue(all(len(c.artwork_ids) == 2 for c in new))
+        self.assertEqual(self.commands(), [])  # Preparation never changes the desktop.
+        for composition in new:
+            self.cli("next", "--no-apply")
+            self.assertEqual(self.state()["current"]["id"], composition.id)
+        self.cli("next", "--no-apply")
+        self.assertEqual(self.state()["current"]["id"], "queued")
+
+    def test_failed_preparation_keeps_the_existing_queue_available(self):
+        self.config_file.write_text(self.config.replace("[llm]\n", "[llm]\nenabled = false\n"))
+        self.post("/api/curate", {})
+        preparation = self.wait_for_preparation()
+        self.assertEqual((preparation["status"], preparation["prepared"]), ("error", 0), preparation)
+        self.assertEqual([c["id"] for c in self.state()["queued"]], ["queued"])
+        self.assertEqual(self.commands(), [])
 
     @settings(max_examples=12, database=None, deadline=None, derandomize=True)
     @given(interval=st.integers(min_value=0, max_value=1500),
@@ -116,6 +171,41 @@ class GalleryTests(HomeTest):
         comment = {"id": "current", "comment": "evil"}
         self.assertEqual(self.call("/api/comment", comment, {"X-Artwall-Token": ""})[0], 403)
         self.assertEqual(self.call("/api/comment", comment, {"Origin": "https://elsewhere.example"})[0], 403)
+        self.assertEqual(self.call("/api/curate", {}, {"X-Artwall-Token": ""})[0], 403)
+        self.assertEqual(self.call("/api/curate", {}, {"Origin": "https://elsewhere.example"})[0], 403)
         self.assertEqual(self.call("/image/not-a-composition")[0], 404)
         self.assertEqual(self.call("/image/..%2F..%2Fetc%2Fpasswd")[0], 404)
         self.assertEqual(self.state()["current"]["comment"], "")
+
+    def test_written_feedback_is_saved_with_context_and_sent_to_future_curation(self):
+        comment = "Less empty space, and pair prints with a similar tonal range."
+        notice = self.post("/api/comment", {"id": "current", "comment": "  " + comment + "\n"})
+        self.assertIn("newly prepared wallpapers", notice)
+        self.assertEqual(self.state()["current"]["comment"], comment)
+        self.assertEqual(self.state()["current"]["id"], "current")
+        art = self.artwork("future", (1800, 1400), title="A Museum Title", artist="An Etcher",
+                           museum_description="A dark hillside slopes down to the water.")
+        with self.database() as db:
+            db.upsert_artwork(art)
+        draft = CuratorDecision("near_single", art.id, (DecisionArtwork(art.id),),
+                                description=art.museum_description)
+        with patch("artwall.curation.OllamaCurator._chat", return_value=draft.to_dict()) as chat:
+            self.cli("curate", "--count", "1")
+        prompt = chat.call_args.args[0]
+        feedback = json.loads(prompt.split("\nViewer feedback: ", 1)[1].split("\nCandidates: ", 1)[0])
+        self.assertEqual(feedback, [{"layout": "near_single",
+                                     "works": [{"title": "The Lighthouse", "artist": "A Painter"}],
+                                     "comment": comment}])
+        self.assertIn("cannot change museum facts", prompt)
+        self.assertIn("Composition review:", prompt)
+        self.assertIn("2.389:1", prompt)
+        with self.database() as db:
+            self.assertEqual(db.get_artwork(art.id).title, "A Museum Title")
+        updated = "Keep the artwork large."
+        self.post("/api/comment", {"id": "current", "comment": updated})
+        self.assertEqual(self.state()["current"]["comment"], updated)
+        self.assertEqual(self.call("/api/comment", {"id": "current", "comment": "x" * 5001})[0], 400)
+        self.assertEqual(self.state()["current"]["comment"], updated)
+        self.post("/api/comment", {"id": "current", "comment": " \n "})
+        with self.database() as db:
+            self.assertEqual(db.curation_feedback(), [])

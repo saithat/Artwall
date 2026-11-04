@@ -40,7 +40,7 @@
             <label><input type="radio" name="count" value="2"><span>Up to two</span></label>
             <label><input type="radio" name="count" value="3"><span>Up to three</span></label>
           </div></fieldset>
-          <p class="field-note">One artwork lets the image and its quiet surroundings breathe.</p>
+          <p class="field-note">Related works can share the wall when they fit together well. One stays alone when it already fills the display.</p>
           <button class="primary-button" type="submit">Save settings <span aria-hidden="true">→</span></button>
         </form>
         <div class="panel-rule"></div>
@@ -53,7 +53,11 @@
       </aside>
     </div>
 
-    <section class="collection-section" id="collection" aria-labelledby="queueTitle"><div class="section-heading"><div><p class="eyebrow">READY TO SHOW</p><h2 id="queueTitle">Coming next <span class="count" id="queueCount"></span></h2></div><p>Prepared locally for instant rotation.</p></div><div class="card-grid" id="queue"></div></section>
+    <section class="collection-section" id="collection" aria-labelledby="queueTitle">
+      <div class="section-heading"><div><p class="eyebrow">READY TO SHOW</p><h2 id="queueTitle">Coming next <span class="count" id="queueCount"></span></h2></div>
+        <div class="prepare-control"><button class="primary-button" id="prepareButton" type="button" aria-describedby="preparationStatus" disabled>Prepare new wallpapers</button><p class="field-note" id="preparationStatus" role="status" aria-live="polite">Uses your saved settings and feedback. New wallpapers go first.</p></div>
+      </div><div class="card-grid" id="queue"></div>
+    </section>
     <section class="collection-section history-section" aria-labelledby="historyTitle"><div class="section-heading"><div><p class="eyebrow">THE ART YOU’VE LIVED WITH</p><h2 id="historyTitle">Recently seen</h2></div><p>Your impressions help shape what appears next.</p></div><div class="card-grid" id="history"></div></section>
     <footer>ARTWALL <span>·</span> REAL ART, QUIETLY CURATED</footer>
   </main>

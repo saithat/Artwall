@@ -81,7 +81,7 @@ def eligible(db: Database, settings: Settings, compositions: Iterable[Compositio
 
 
 def upcoming(db: Database, settings: Settings) -> Iterator[Composition]:
-    """Unshown compositions that can still be shown, oldest first."""
+    """Unshown compositions, requested batches first and otherwise oldest first."""
     return eligible(db, settings, db.list_compositions(only_unshown=True))
 
 

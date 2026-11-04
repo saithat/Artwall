@@ -2,7 +2,7 @@
 
 A local, open-source-friendly museum curator for a Wayland desktop. It discovers public-domain works from the Art Institute of Chicago, asks a **local vision model** to select and compose them, renders 3440 × 1440 wallpapers with small editorial captions, and keeps a ready-to-show offline queue. One artwork per wallpaper is the default.
 
-Artwork is never generated or recolored. The museum supplies titles, artists, dates, rights, and source pages. The model chooses the work, layout, and short source-grounded caption. Rendering is deterministic. A narrow work remains intact on a muted matte drawn from its colors, with the caption in the exposed space when it fits.
+Artwork is never generated or recolored. The museum supplies titles, artists, dates, rights, and source pages. The model chooses the work, layout, and short source-grounded caption. Rendering is deterministic. A narrow work remains intact against a softly blurred, subdued backdrop drawn from its colors. A fine border and soft shadow distinguish the sharp original from its surround, with the caption in the exposed space when it fits.
 
 ## First wallpaper
 
@@ -24,7 +24,7 @@ The default local curator is the installed `qwen3.6:27b` vision model through Ol
 artwall curate --offline --count 5
 ```
 
-The Art Institute asks clients to download one image at a time with about a second between requests. An initial refresh and cache fill can take a few minutes. Later runs reuse SQLite API responses and image files. Scheduled refreshes advance through results pages, so the local catalog continues to expand; `artwall refresh --page N` targets a page explicitly.
+The Art Institute asks clients to download one image at a time with about a second between requests. An initial refresh and cache fill can take a few minutes. Later runs reuse SQLite API responses and image files. Cached and downloaded JPEGs must fully decode before curation. A damaged cache file is downloaded again; if its replacement fails, that candidate is skipped so other works can still be prepared. Scheduled refreshes advance through results pages, so the local catalog continues to expand; `artwall refresh --page N` targets a page explicitly.
 
 ## Everyday commands
 
@@ -46,6 +46,7 @@ artwall debug-current           Raw museum metadata and curator decision
 artwall render --output FILE    Re-render the current decision
 artwall refresh                 Update museum metadata
 artwall curate --count 14       Prepare future wallpapers
+artwall curate --count 3 --next Prepare wallpapers to show ahead of the old queue
 ```
 
 The commands are intentionally small so they can be bound in `~/.config/niri/config.kdl`. For example, a Niri `spawn` binding can run `artwall next` or `artwall favorite`; see Niri's syntax for the version installed on your machine.
@@ -54,9 +55,17 @@ The commands are intentionally small so they can be bound in `~/.config/niri/con
 
 Run `artwall gui` to open the local interface at `http://127.0.0.1:8765`. It shows the current wallpaper, upcoming rotation, and history. You can like, dislike, or comment on a composition; set the rotation interval and local Ollama model; maintain artist and artwork blacklists; and allow one, two, or three concurrent works. It serves only on loopback and uses no remote web assets. The command `artwall gui --no-open` starts the interface without opening a browser.
 
+**Prepare new wallpapers**, beside **Coming next**, prepares up to three wallpapers in the background using saved settings and feedback. Progress and failures appear beside the button. New results go to the front of the queue; the current wallpaper, older queued work, history, and favorites are preserved. Use it after saving layout settings or feedback to see their effect without waiting through an older batch. The command-line equivalent is `artwall curate --count 3 --next`; ordinary scheduled curation continues to append to the queue.
+
+The **Feedback for the curator** field appears directly below the current wallpaper. Upcoming and past compositions have the same field under **Details & feedback**. Describe spacing, pairings, captions, or what you like about the work. Notes are saved locally, can be edited or cleared, and the eight most recently edited notes are supplied to the local model with their artwork and layout context during future curation (up to 800 characters per note). Feedback guides preferences; it cannot override museum facts or validation. It does not re-render existing wallpapers, and offline curation does not interpret written feedback.
+
 Thumbs down on the current work immediately shows the next eligible cached composition. Thumbs down on an upcoming work removes it from rotation. The disliked work stays out of future curation until that feedback is reversed. If no alternative is cached, the dislike is saved and the gallery says why the wallpaper stayed put.
 
-Changing the artwork limit filters previously queued multiwork compositions from rotation immediately. Prepare fresh single artwork wallpapers with `artwall curate`. Previously viewed compositions remain in history.
+Lowering the artwork limit filters previously queued compositions that exceed it immediately. Raising the limit allows more works in newly prepared layouts; it does not rearrange already rendered wallpapers. Save the setting, then choose **Prepare new wallpapers** to put fresh layouts next in rotation. Previously viewed compositions remain in history.
+
+With **Up to two** or **Up to three**, a work that already fits the display stays alone. A narrow selection is compared with related pairs and, when allowed, trios at the actual display proportions. The coverage check prefers balanced groups with compatible colors and tonal contrast. Whole works share aligned edges, a common height, and a small consistent gap. If a suitable grouping is unavailable, the intact original keeps its diffuse surround; an enlarged detail is only used when explicitly chosen by the curator. Existing cached PNGs retain their prepared layouts; `artwall curate` prepares wallpapers with the current layout rules, while `artwall render --output FILE` previews the current decision with the updated renderer.
+
+Wallpaper captions wrap titles, metadata, companion labels, and the prepared description without cutting them off at a fixed number of lines. Line spacing follows the measured font size. If a complete caption is too tall, the renderer tries a wider column and then smaller type, keeping the text and its shadow inside the display margins. Full museum titles and catalog details remain available in the gallery and `artwall info`.
 
 ## Scheduling
 
@@ -89,11 +98,15 @@ With Hyprlock, artwall configures its background to reference `~/.cache/artwall/
 
 1. **Retrieve:** ArtIC's API supplies public-domain artworks with source URLs and rights metadata. SQLite caches API responses and normalized records.
 2. **Filter and rank:** Recent works and blacklisted items are excluded; taste seeds, explicit artist feedback, novelty, resolution, and a configurable mix of exploration select a candidate pool.
-3. **Curate:** Ollama receives a labeled contact sheet of cached thumbnails plus museum metadata. It returns a constrained JSON decision. With the default limit it selects one work. If a multiwork selection must be reduced to one, a second local vision pass describes the final work. Local validation checks IDs, crop bounds, layout counts, and unsupported historical claims. A metadata-based fallback works without the model.
-4. **Render:** Pillow renders a wide work full bleed with only a very mild crop. Other proportions remain whole on a subdued color matte derived from the artwork, with a thin edge to separate the original from its surround. Captions go in a side or lower matte band if they fit; otherwise placement evaluates four image corners and adds a localized gradient when needed. Two-work, three-work, and same-work detail templates remain available when the artwork limit is raised.
+3. **Curate:** Ollama receives a labeled contact sheet of cached thumbnails, museum metadata, a short composition rubric, and recent written feedback. It returns a constrained JSON decision. With the default limit it selects one work. Local geometry checks compare intact single, paired, and grouped works for useful display coverage. If the selection changes, a second local vision pass describes the final works. Local validation checks IDs, crop bounds, layout counts, and unsupported historical claims. A metadata-based fallback works without the model.
+4. **Render:** Pillow renders a wide work full bleed with only a very mild crop. Other proportions remain whole against a low-contrast, heavily blurred backdrop derived from the artwork. Only the backdrop is blurred and subdued; a thin edge and soft shadow separate the original from its surround. Pairs and trios keep their original proportions and paper margins at a shared height. Captions go in a side or lower surround if they fit; otherwise placement evaluates four image corners and adds a localized gradient when needed. Same-work detail templates remain available when the artwork limit is raised and the curator chooses a meaningful detail.
 5. **Queue and show:** PNGs and decisions are stored before display. `next` sets a cached image through the wallpaper adapter, updates the lock screen, and records history and feedback in SQLite.
 
 Source interfaces, desktop backends, and the renderer are separate modules so additional museums or display tools can be added without changing the queue and CLI.
+
+## Composition guidance
+
+The curator's bundled rubric adapts [Getty's Principles of Design](https://www.getty.edu/education/teachers/building_lessons/formal_analysis2.html) and the [National Gallery of Art's Elements of Art: Color](https://www.nga.gov/educational-resources/elements-art/elements-art-color). Getty provides a vocabulary for balance, emphasis, movement, proportion, rhythm, and unity; the Gallery offers concrete ways to assess color relationships and atmosphere. The wallpaper-specific rules apply those ideas to visual weight, compatible palettes and tonal density, aligned edges, restrained captions, and purposeful negative space. These are selection guidelines, not a score that can guarantee taste. The references are documented here; the short rubric ships locally and requires no web retrieval during curation.
 
 ## Current scope
 

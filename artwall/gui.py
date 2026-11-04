@@ -12,12 +12,14 @@ import logging
 import re
 import secrets
 import shutil
+import subprocess
+import sys
 import webbrowser
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import islice
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any, cast
 from urllib.parse import urlsplit
 from urllib.request import urlopen
@@ -130,6 +132,51 @@ class GuiContext:
     unit_dir: Path
     token: str = field(default_factory=lambda: secrets.token_urlsafe(32), repr=False)
     feedback_lock: Lock = field(default_factory=Lock, repr=False)
+    preparation_lock: Lock = field(default_factory=Lock, repr=False)
+    preparation_status: str = "idle"
+    prepared_count: int = 0
+    preparation_message: str = "Uses your saved settings and feedback. New wallpapers go first."
+
+    def preparation_state(self) -> dict[str, Any]:
+        with self.preparation_lock:
+            return {"status": self.preparation_status, "prepared": self.prepared_count,
+                    "message": self.preparation_message}
+
+    def start_preparation(self) -> str:
+        """Run the normal curator in the background, keeping gallery requests responsive."""
+        with self.preparation_lock:
+            if self.preparation_status == "running":
+                return "Already preparing new wallpapers."
+            process = subprocess.Popen(
+                [sys.executable, "-m", "artwall.cli", "curate", "--count", "3", "--next"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+            self.preparation_status = "running"
+            self.prepared_count = 0
+            self.preparation_message = "Preparing 3 wallpapers with your saved settings. This may take a few minutes."
+            Thread(target=self._watch_preparation, args=(process,), daemon=True).start()
+        return "Preparing new wallpapers. You can keep using the gallery."
+
+    def _watch_preparation(self, process: subprocess.Popen[str]) -> None:
+        assert process.stdout is not None
+        with process.stdout:
+            for line in process.stdout:
+                if line.startswith("Queued "):
+                    with self.preparation_lock:
+                        self.prepared_count += 1
+                        self.preparation_message = f"{self.prepared_count} of 3 wallpapers ready. Still preparing…"
+                else:
+                    LOG.warning("curator: %s", line.rstrip())
+        result = process.wait()
+        with self.preparation_lock:
+            count = self.prepared_count
+            self.preparation_status = "ready" if result == 0 else "error"
+            if result == 0:
+                self.preparation_message = f"{count} new wallpaper{'s' if count != 1 else ''} ready at the front of Coming next."
+            elif count:
+                self.preparation_message = f"{count} wallpapers ready, but preparation stopped early. Try again to prepare more."
+            else:
+                self.preparation_message = "No new wallpapers could be prepared. Check the museum connection and try again."
 
     def image_path(self, composition_id: str) -> Path:
         if not _ID.fullmatch(composition_id):
@@ -221,7 +268,10 @@ def make_handler(context: GuiContext) -> type[BaseHTTPRequestHandler]:
                     with Database(context.database_path) as db:
                         state = gallery_state(db, load_config(context.config_file))
                     state["csrf_token"] = context.token
+                    state["preparation"] = context.preparation_state()
                     self._json(200, state)
+                elif path == "/api/preparation":
+                    self._json(200, context.preparation_state())
                 elif path == "/api/models":
                     self._json(200, {"models": _installed_models(load_config(context.config_file))})
                 elif path.startswith("/image/"):
@@ -261,6 +311,8 @@ def make_handler(context: GuiContext) -> type[BaseHTTPRequestHandler]:
                 self._error(500, "Could not save this change")
 
         def _mutate(self, path: str, body: dict[str, Any]) -> str:
+            if path == "/api/curate":
+                return context.start_preparation()
             if path == "/api/settings":
                 interval = body.get("interval_minutes")
                 count = body.get("max_artworks")
@@ -280,7 +332,7 @@ def make_handler(context: GuiContext) -> type[BaseHTTPRequestHandler]:
                     if not executable or not update_rotate_timer(
                             settings, str(Path(executable).resolve()), directory=context.unit_dir):
                         return "Settings saved. Run artwall install-timers to apply the new rotation interval."
-                return "Settings saved. New artwork count applies to upcoming compositions."
+                return "Settings saved. Choose Prepare new wallpapers to create layouts with these settings."
             if path == "/api/feedback":
                 composition_id = body.get("id")
                 kind = body.get("kind")
@@ -302,7 +354,7 @@ def make_handler(context: GuiContext) -> type[BaseHTTPRequestHandler]:
                     raise ValueError("Comment must be at most 5000 characters")
                 with Database(context.database_path) as db:
                     db.set_comment(composition_id, comment.strip())
-                return "Note saved"
+                return "Feedback saved. It will guide newly prepared wallpapers."
             if path == "/api/blacklist/artist":
                 artist = body.get("artist")
                 blocked = body.get("blocked")
