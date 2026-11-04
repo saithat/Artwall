@@ -30,6 +30,7 @@ from artwall.systemd import user_unit_dir, write_units
 
 LOG = logging.getLogger("artwall")
 Handler = Callable[[argparse.Namespace, Settings], None]
+_MIN_DIMENSION = 1400  # longest side, in pixels, a wallpaper source must have
 
 
 def _database() -> Database:
@@ -73,11 +74,17 @@ def _taste(db: Database, reserved: set[str]) -> Taste:
     )
 
 
+def _known_low_resolution(art: Artwork) -> bool:
+    """A cached download at the largest size the museum serves is still too small."""
+    return bool(art.cached_image_path) and max(art.image_width or 0, art.image_height or 0) < _MIN_DIMENSION
+
+
 def _select_pool(db: Database, settings: Settings, taste: Taste, reserved: set[str]) -> list[Artwork]:
     """Mostly the best-scoring works, plus seeded exploration and wildcards."""
     exclusions = rotation.Exclusions.load(db, settings)
     scored = [(score, art) for art in db.list_artworks(limit=3000)
               if art.public_domain and art.open_access and exclusions.allows(art)
+              and not _known_low_resolution(art)
               and math.isfinite(score := score_candidate(art, taste))]
     ranked = [art for _, art in sorted(scored, key=lambda pair: pair[0], reverse=True)]
     count = settings.candidate_pool_size
@@ -96,17 +103,24 @@ def _prepare_images(db: Database, source: ArtworkSource, candidates: list[Artwor
     available = []
     for art in candidates:
         try:
-            if not source.verify_cached_image(art, min_dimension=1400):
+            if not source.verify_cached_image(art, min_dimension=_MIN_DIMENSION):
                 source.download_image(art, data_dir() / "cache" / "images", width=4096, force=True)
-                if (art.image_width or 0) < 1400 and (art.image_height or 0) < 1400:
+                if _known_low_resolution(art):
                     LOG.info("candidate_excluded reason=low_resolution id=%s size=%sx%s",
                              art.id, art.image_width, art.image_height)
+                    db.upsert_artwork(art)  # Remember the result instead of downloading it every round.
                     continue
             db.upsert_artwork(art)
             available.append(art)
         except Exception as exc:
             LOG.warning("candidate_excluded reason=image_failure id=%s error=%s", art.id, exc)
     return available
+
+
+def _queued_since(db: Database, since: float) -> set[str]:
+    """Works queued by any curation run, including a concurrent one, since a time."""
+    return {artwork_id for composition in db.list_compositions(only_unshown=True)
+            if composition.created_at >= since for artwork_id in composition.artwork_ids}
 
 
 def _render(db: Database, decision: CuratorDecision, settings: Settings, output: Path) -> RenderResult:
@@ -180,12 +194,14 @@ def cmd_curate(args: argparse.Namespace, settings: Settings) -> None:
     curator = (OllamaCurator(settings.model, settings.ollama_url, description_words=settings.caption_words)
                if settings.use_local_model and not args.offline else None)
     created = 0
-    queue_priority = time.time() if args.next else 0
+    started = time.time()
+    queue_priority = started if args.next else 0
     with _database() as db:
         source = ArticSource(db)
         reserved = {artwork_id for composition in rotation.upcoming(db, settings)
                     for artwork_id in composition.artwork_ids}
         for _ in range(count):
+            reserved |= _queued_since(db, started)
             taste = _taste(db, reserved)
             pool = _prepare_images(db, source, _select_pool(db, settings, taste, reserved))
             if not pool:
@@ -193,6 +209,12 @@ def cmd_curate(args: argparse.Namespace, settings: Settings) -> None:
             decision = choose_composition(pool, taste, max_artworks=settings.max_artworks,
                                           screen_ratio=settings.width / settings.height, curator=curator,
                                           feedback=db.curation_feedback())
+            # The gallery, a timer, or the command line may be curating at the
+            # same time. Re-check just before rendering so no work is queued twice.
+            reserved |= _queued_since(db, started)
+            if reserved.intersection(decision.artwork_ids):
+                LOG.info("composition_skipped reason=queued_concurrently artworks=%s", decision.artwork_ids)
+                continue
             composition = _queue(db, decision, settings, queue_priority=queue_priority)
             reserved.update(composition.artwork_ids)
             created += 1

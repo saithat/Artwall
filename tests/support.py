@@ -103,7 +103,7 @@ class HomeTest(unittest.TestCase):
         image = data_dir() / "compositions" / f"{identifier}.png"
         image.parent.mkdir(parents=True, exist_ok=True)
         Image.new("RGB", (860, 360), "#282828").save(image)
-        layout = fields.pop("layout", ("near_single", "diptych_50", "triptych")[len(works) - 1])
+        layout = fields.pop("layout", ("near_single", "diptych", "triptych")[len(works) - 1])
         chosen = CuratorDecision(layout, works[0].id, tuple(DecisionArtwork(art.id) for art in works), **fields)
         composition = Composition(identifier, chosen, str(image), created_at=self.clock)
         db.add_composition(composition)

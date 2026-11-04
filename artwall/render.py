@@ -4,15 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import colorsys
+from functools import lru_cache
 from io import BytesIO
 import math
 from pathlib import Path
 import re
-from typing import Mapping, NamedTuple
+from typing import Mapping, NamedTuple, cast
 
 from PIL import Image, ImageChops, ImageCms, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageStat
 
-from artwall.models import ANCHORS, Anchor, Artwork, Crop, CuratorDecision, Layout
+from artwall.models import ANCHORS, Anchor, Artwork, Crop, CuratorDecision, Layout, ratio_fit
 
 
 RGB = tuple[int, int, int]
@@ -59,11 +60,6 @@ class _Line(NamedTuple):
     spacing: int
 
 
-def _retained(ratio: float, target: float) -> float:
-    """The fraction of an image kept when cropping it to the target ratio."""
-    return min(ratio / target, target / ratio)
-
-
 def _source_crop(origin: tuple[int, int], box: Rect, size: tuple[int, int]) -> Crop:
     """The region of an original image shown by a box within its region at origin."""
     (left, top), (width, height) = origin, size
@@ -71,7 +67,9 @@ def _source_crop(origin: tuple[int, int], box: Rect, size: tuple[int, int]) -> C
                 (box[2] - box[0]) / width, (box[3] - box[1]) / height)
 
 
+@lru_cache(maxsize=64)
 def _font(path: str | None, family: str, size: int) -> Font:
+    """Load a font once; caption fitting measures the same sizes many times."""
     choices = [path, f"/usr/share/fonts/google-noto/{family}-Regular.ttf"]
     for choice in choices:
         if choice:
@@ -169,12 +167,12 @@ def _fit_panel(image: Image.Image, box: Rect, *, explicit_crop: Crop | None,
     target_ratio = panel_w / panel_h
     region = explicit_crop.box(*image.size) if explicit_crop else (0, 0, *image.size)
     part = image.crop(region) if explicit_crop else image
-    retained = _retained(part.width / part.height, target_ratio)
+    retained = ratio_fit(part.width / part.height, target_ratio)
     if explicit_crop and not allow_large_crop and explicit_crop.area * retained < 1 - safe_crop_fraction:
         # The curator's ROI plus the panel fit would remove too much of the
         # original. Revert to the whole work before considering any panel crop.
         explicit_crop, region, part = None, (0, 0, *image.size), image
-        retained = _retained(image.width / image.height, target_ratio)
+        retained = ratio_fit(image.width / image.height, target_ratio)
     if retained >= 1 - safe_crop_fraction or allow_large_crop:
         crop_box = _focus_crop(part, target_ratio)
         return (part.crop(crop_box).resize((panel_w, panel_h), RESAMPLE),
@@ -235,6 +233,16 @@ def _ambient_background(image: Image.Image, size: tuple[int, int], matte: RGB) -
     return colors.resize(size, RESAMPLE)
 
 
+def _draw_shadows(canvas: Image.Image, rects: list[Rect]) -> None:
+    """Soft shadows under every original. Draw them all before pasting any
+    artwork, so a neighbor's shadow can never darken pixels already placed."""
+    shadow = Image.new("L", canvas.size)
+    draw = ImageDraw.Draw(shadow)
+    for rect in rects:
+        draw.rectangle(rect, fill=110)
+    canvas.paste((12, 13, 13), (0, 0), shadow.filter(ImageFilter.GaussianBlur(max(3, canvas.height * 0.012))))
+
+
 def _mount_artwork(canvas: Image.Image, image: Image.Image, box: Rect, border: RGB, *,
                    add_shadow: bool = True) -> Rect:
     """Keep a crisp, framed original distinct from the diffuse surround."""
@@ -243,9 +251,7 @@ def _mount_artwork(canvas: Image.Image, image: Image.Image, box: Rect, border: R
     top = box[1] + (box[3] - box[1] - fitted.height) // 2
     rect = (left, top, left + fitted.width, top + fitted.height)
     if add_shadow:
-        shadow = Image.new("L", canvas.size)
-        ImageDraw.Draw(shadow).rectangle(rect, fill=110)
-        canvas.paste((12, 13, 13), (0, 0), shadow.filter(ImageFilter.GaussianBlur(max(3, canvas.height * 0.012))))
+        _draw_shadows(canvas, [rect])
     line = max(1, round(canvas.height * 0.0015))
     ImageDraw.Draw(canvas).rectangle(
         (left - line, top - line, rect[2] + line - 1, rect[3] + line - 1),
@@ -264,12 +270,12 @@ def _fit_single(image: Image.Image, settings: RenderSettings, explicit_crop: Cro
     # but a single-work wallpaper should never quietly discard a large area.
     crop = explicit_crop if explicit_crop and explicit_crop.area >= 0.96 else None
     region = crop.box(*size) if crop else (0, 0, *size)
-    if crop and crop.area * _retained((region[2] - region[0]) / (region[3] - region[1]), target) < 0.96:
+    if crop and crop.area * ratio_fit((region[2] - region[0]) / (region[3] - region[1]), target) < 0.96:
         crop, region = None, (0, 0, *size)
     if crop:
         image = image.crop(region)
     source_ratio = image.width / image.height
-    if _retained(source_ratio, target) >= 0.96:
+    if ratio_fit(source_ratio, target) >= 0.96:
         crop_box = _focus_crop(image, target)
         filled = image.crop(crop_box).resize((settings.width, settings.height), RESAMPLE)
         return filled, (0, 0, settings.width, settings.height), _source_crop(region[:2], crop_box, size), None
@@ -300,7 +306,7 @@ def _panels(layout: Layout, ids: list[str], settings: RenderSettings,
         split = round(w * (0.42 if ratios[ids[0]] < 0.95 else 0.69))
         return [(ids[0], (0, 0, split - g // 2, h), False),
                 (ids[0], (split + g // 2, 0, w, h), True)]
-    if layout in ("diptych_50", "diptych_60", "triptych"):
+    if layout in ("diptych", "triptych"):
         # One aligned row at a common height, with widths following the actual
         # originals. Fixed slots waste space or crop works of differing shapes.
         inset = max(2, round(min(w, h) * 0.006))
@@ -342,15 +348,16 @@ def _text_wrap(draw: ImageDraw.ImageDraw, text: str, font: Font, max_width: int)
 
 def _display_title(title: str) -> str:
     """Use an authoritative series name when the object title is a long list."""
-    if len(title) > 105 and "(" in title:
+    if len(title) <= 105:
+        return title
+    if "(" in title:
         short = title.split("(", 1)[0].strip(" ,")
         if 8 < len(short) < 75:
             return short
-    if len(title) > 105:
-        initial = title.split(",", 1)[0].strip()
-        if 10 < len(initial) < 75 and not re.match(r"^\d+[.)]", initial):
-            return initial
-    if len(title) > 105 and (match := re.search(r"\bfrom\s+(.+)$", title, re.IGNORECASE)):
+    initial = title.split(",", 1)[0].strip()
+    if 10 < len(initial) < 75 and not re.match(r"^\d+[.)]", initial):
+        return initial
+    if match := re.search(r"\bfrom\s+(.+)$", title, re.IGNORECASE):
         series = re.sub(r"^the\s+series\s+", "", match.group(1), flags=re.IGNORECASE).strip(" .\"")
         if 8 < len(series) < 100:
             return series
@@ -502,8 +509,7 @@ def _matte_caption(canvas: Image.Image, artwork_rect: Rect, decision: CuratorDec
                 x = outer_pad if side == "left" else right + edge_pad
                 on_top = requested.startswith("top")
                 y = outer_pad if on_top else settings.height - outer_pad - content_h
-                anchor: Anchor = ("top_left" if side == "left" else "top_right") if on_top else (
-                    "bottom_left" if side == "left" else "bottom_right")
+                anchor = cast(Anchor, f"{'top' if on_top else 'bottom'}_{side}")
                 return lines, (x, y, x + content_w, y + content_h), anchor, f"matte_{side}"
 
     # A very wide original leaves a horizontal band. Keep the image anchored
@@ -538,28 +544,19 @@ def render_wallpaper(decision: CuratorDecision, artworks: Mapping[str, Artwork],
     images = {artwork_id: _open_art(artworks[artwork_id]) for artwork_id in ids}
     panels = _panels(decision.layout, ids, settings,
                      {artwork_id: image.width / image.height for artwork_id, image in images.items()})
-    canvas = Image.new("RGB", (settings.width, settings.height), BACKGROUND)
-    if len(panels) > 1:
-        ImageDraw.Draw(canvas).rectangle((0, 0, settings.width, settings.height), fill=GUTTER)
+    size = (settings.width, settings.height)
     crops: dict[str, Crop | None] = {}
     entry_crops = {entry.id: entry.crop for entry in decision.artworks}
     artwork_rect: Rect | None = None
     matte_color: RGB | None = None
     if len(panels) == 1:
         artwork_id = panels[0][0]
-        fitted, artwork_rect, crops[artwork_id], matte_color = _fit_single(
+        canvas, artwork_rect, crops[artwork_id], matte_color = _fit_single(
             images[artwork_id], settings, entry_crops[artwork_id])
-        canvas.paste(fitted, (0, 0))
     elif decision.layout != "artwork_detail":
         matte_color, _ = _matte_colors(images[decision.primary_artwork_id])
-        canvas = _ambient_background(images[decision.primary_artwork_id], canvas.size, matte_color)
-        # Draw every shadow before any original, so a neighboring panel's
-        # shadow can never darken artwork pixels that have already been pasted.
-        shadow = Image.new("L", canvas.size)
-        shadow_draw = ImageDraw.Draw(shadow)
-        for _, box, _ in panels:
-            shadow_draw.rectangle(box, fill=110)
-        canvas.paste((12, 13, 13), (0, 0), shadow.filter(ImageFilter.GaussianBlur(max(3, canvas.height * 0.012))))
+        canvas = _ambient_background(images[decision.primary_artwork_id], size, matte_color)
+        _draw_shadows(canvas, [box for _, box, _ in panels])
         mounted = []
         for artwork_id, box, _ in panels:
             image = images[artwork_id]
@@ -569,6 +566,7 @@ def render_wallpaper(decision: CuratorDecision, artworks: Mapping[str, Artwork],
         artwork_rect = (min(box[0] for box in mounted), min(box[1] for box in mounted),
                         max(box[2] for box in mounted), max(box[3] for box in mounted))
     else:
+        canvas = Image.new("RGB", size, GUTTER)
         for artwork_id, box, detail in panels:
             image = images[artwork_id]
             crop = decision.detail_crop if detail else entry_crops[artwork_id]

@@ -3,11 +3,16 @@
 import json
 from io import BytesIO
 from pathlib import Path
+import threading
+import time
 from unittest.mock import patch
 
 from PIL import Image, ImageChops, ImageDraw, ImageOps, ImageStat
 
+from artwall import cli
+from artwall.config import database_path
 from artwall.models import CuratorDecision, DecisionArtwork
+from artwall.storage import Database
 from tests.support import HomeTest
 
 class CliTests(HomeTest):
@@ -109,7 +114,7 @@ class CliTests(HomeTest):
             ("pair", 2, ((1600, 1450), (1600, 1450)), "near_single", 2),
             ("trio", 3, ((1500, 2000),) * 3, "near_single", 3),
             ("wide", 3, ((3200, 1400), (1600, 1450)), "single", 1),
-            ("overfull", 2, ((3200, 1400),) * 2, "diptych_50", 1),
+            ("overfull", 2, ((3200, 1400),) * 2, "diptych", 1),
             ("unrelated", 3, ((1600, 1450),), "near_single", 1),
         )
         for name, limit, sizes, layout, expected in cases:
@@ -121,7 +126,7 @@ class CliTests(HomeTest):
                     for work in works:
                         db.upsert_artwork(work)
                 draft = CuratorDecision(layout, works[0].id,
-                                        tuple(DecisionArtwork(w.id) for w in works[:2 if layout == "diptych_50" else 1]),
+                                        tuple(DecisionArtwork(w.id) for w in works[:2 if layout == "diptych" else 1]),
                                         use_gradient=False)
                 with patch("artwall.curation.OllamaCurator._chat", return_value=draft.to_dict()), \
                      patch("artwall.curation.OllamaCurator.describe_final", side_effect=lambda decision, pool: decision):
@@ -277,3 +282,86 @@ class CliTests(HomeTest):
             self.assertEqual([item.id for item in db.list_compositions(only_unshown=True)], ["third"])
         self.cli("next", "--no-apply")
         self.assertEqual(self.current_id(), "third")
+
+    def test_upgrade_survives_concurrent_and_interrupted_migrations(self):
+        self.configure("[curation]\nmax_artworks = 2\n")
+        with self.database() as db:
+            self.queue(db, "legacy", self.artwork("1"), self.artwork("2"))
+            # Earlier releases stored pairs as diptych_50 or diptych_60.
+            db.connection.execute("UPDATE compositions SET payload=replace(payload, '\"diptych\"', '\"diptych_60\"')")
+            db.connection.execute("DROP INDEX idx_compositions_queue")
+            db.connection.execute("ALTER TABLE compositions DROP COLUMN queue_priority")
+            db.connection.execute("PRAGMA user_version = 2")
+            db.connection.commit()
+        # A login rotation and a timer can open an older database at the same moment.
+        start, errors = threading.Barrier(4), []
+
+        def open_database() -> None:
+            start.wait()
+            try:
+                Database(database_path()).close()
+            except Exception as exc:  # pragma: no cover - reported below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=open_database) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        # A process that stopped after adding the column but before recording the version.
+        with self.database() as db:
+            db.connection.execute("PRAGMA user_version = 2")
+            db.connection.commit()
+        self.assertIn("Queued: 1", self.cli("status"))
+        self.cli("next", "--no-apply")
+        with self.database() as db:
+            self.assertEqual(db.get_current().decision.layout, "diptych")
+            self.assertEqual(db.connection.execute("PRAGMA user_version").fetchone()[0], 3)
+
+    def test_low_resolution_works_are_downloaded_once(self):
+        # ArtIC serves some public-domain works only at 843 pixels wide,
+        # although the catalog lists a much larger original.
+        small = self.artwork("700", (843, 600), image_width=3000, image_height=2135,
+                             iiif_url="https://www.artic.edu/iiif/2/small-image")
+        served = BytesIO()
+        Image.new("RGB", (843, 600)).save(served, format="JPEG")
+
+        def respond(url: str) -> BytesIO:
+            response = BytesIO(served.getvalue())
+            response.headers = {"Content-Type": "image/jpeg"}
+            return response
+
+        with self.database() as db:
+            db.upsert_artwork(small)
+            for index in range(2):
+                db.upsert_artwork(self.artwork(str(710 + index), (1600, 1450)))
+        with patch("artwall.sources.artic.ArticSource._open", side_effect=respond) as download:
+            for _ in range(2):
+                self.assertIn("Queued", self.cli("curate", "--offline", "--count", "1"))
+        download.assert_called_once()
+        with self.database() as db:
+            self.assertFalse(any(small.id in c.artwork_ids for c in db.list_compositions()))
+
+    def test_curation_skips_works_queued_concurrently_by_another_run(self):
+        with self.database() as db:
+            for index in range(4):
+                db.upsert_artwork(self.artwork(str(800 + index), (1600, 1450)))
+        real_choose = cli.choose_composition
+        raced = []
+
+        def choose_while_another_run_queues(pool, taste, **options):
+            decision = real_choose(pool, taste, **options)
+            if not raced:  # Another curator queues the same work first.
+                self.clock = time.time()
+                with self.database() as other:
+                    raced.append(self.queue(other, "other-run", other.get_artwork(decision.primary_artwork_id)))
+            return decision
+
+        with patch("artwall.cli.choose_composition", side_effect=choose_while_another_run_queues), \
+                self.assertLogs("artwall", level="INFO") as logs:
+            self.assertEqual(self.cli("curate", "--offline", "--count", "2").count("Queued"), 1)
+        self.assertTrue(any("queued_concurrently" in line for line in logs.output))
+        with self.database() as db:
+            queued = [i for c in db.list_compositions(only_unshown=True) for i in c.artwork_ids]
+        self.assertEqual(len(queued), len(set(queued)), queued)

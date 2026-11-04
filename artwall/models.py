@@ -7,12 +7,23 @@ import math
 import time
 from typing import Any, Literal, Mapping, cast, get_args
 
-Layout = Literal["single", "near_single", "diptych_50", "diptych_60", "triptych", "artwork_detail"]
+Layout = Literal["single", "near_single", "diptych", "triptych", "artwork_detail"]
 Anchor = Literal["bottom_left", "bottom_right", "top_left", "top_right"]
 LAYOUT_COUNTS: dict[Layout, int] = {
-    "single": 1, "near_single": 1, "diptych_50": 2, "diptych_60": 2, "triptych": 3, "artwork_detail": 1,
+    "single": 1, "near_single": 1, "diptych": 2, "triptych": 3, "artwork_detail": 1,
 }
+# Earlier releases split pairs into fixed 50/50 and 60/40 slots. Both now
+# render as one row sized to the originals, so stored decisions are read as one.
+_LEGACY_LAYOUTS = {"diptych_50": "diptych", "diptych_60": "diptych"}
 ANCHORS: tuple[Anchor, ...] = get_args(Anchor)
+
+
+def ratio_fit(ratio: float, target: float) -> float:
+    """How closely one aspect ratio matches another, from 0 to 1.
+
+    This is also the fraction of an image kept when cropping it to the target.
+    """
+    return min(ratio / target, target / ratio)
 
 
 class DecisionError(ValueError):
@@ -175,7 +186,8 @@ class CuratorDecision:
         if not all(isinstance(value, str) for value in text.values()):
             raise DecisionError("Decision text fields must be strings")
         # __post_init__ checks the layout, anchor, and primary ID values.
-        return cls(layout=cast(Layout, raw.get("layout")),
+        layout = raw.get("layout")
+        return cls(layout=cast(Layout, _LEGACY_LAYOUTS.get(layout, layout) if isinstance(layout, str) else layout),
                    primary_artwork_id=cast(str, raw.get("primary_artwork_id")),
                    artworks=tuple(artworks), caption_anchor=raw.get("caption_anchor", "bottom_left"),
                    caption_max_width_px=width, use_gradient=raw.get("use_gradient", True),

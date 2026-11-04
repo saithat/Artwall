@@ -91,10 +91,12 @@ def _jpeg_size(path: Path) -> tuple[int, int]:
             if image.format != "JPEG":
                 raise SourceError(f"{path.name} is not a JPEG")
             size = image.size
-            # JPEG verify() only checks the header. Decode the pixels as the
-            # renderer will, so a truncated download cannot poison a batch.
+            # JPEG verify() only checks the header. Decoding reads every scan,
+            # so a truncated download cannot poison a batch. Draft mode decodes
+            # at 1/8 scale, which still reads all the data but much faster.
+            image.draft("RGB", (max(1, size[0] // 8), max(1, size[1] // 8)))
             image.load()
-    except (UnidentifiedImageError, OSError) as exc:
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
         raise SourceError(f"{path.name} is unreadable: {exc}") from exc
     return size
 

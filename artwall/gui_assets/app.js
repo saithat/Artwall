@@ -54,6 +54,8 @@ function findRecord(id) {
   return [gallery.current, ...gallery.queued, ...gallery.history].find((item) => item && item.id === id);
 }
 
+function byline(...parts) { return parts.filter(Boolean).join(" · "); }
+
 function dateLabel(seconds) {
   if (!seconds) return "";
   return new Date(seconds * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
@@ -171,8 +173,7 @@ function renderCurrent() {
   const meta = node("div", "current-meta");
   const information = node("div");
   information.append(node("h3", "work-title", record.title));
-  const subtitle = [record.artist, record.date].filter(Boolean).join(" · ");
-  information.append(node("p", "work-byline", subtitle));
+  information.append(node("p", "work-byline", byline(record.artist, record.date)));
   if (record.description) information.append(node("p", "work-description", record.description));
   if (record.artworks.length > 1) information.append(node("p", "work-byline", `Also showing: ${record.artworks.slice(1).map((item) => item.title).join(" · ")}`));
   const controls = node("div", "current-actions");
@@ -203,7 +204,7 @@ function renderCards(records, targetId, emptyMessage) {
     card.append(imageButton);
     const body = node("div", "art-card-body");
     body.append(node("h3", "art-card-title", record.title));
-    body.append(node("p", "art-card-meta", [record.artist, record.date].filter(Boolean).join(" · ")));
+    body.append(node("p", "art-card-meta", byline(record.artist, record.date)));
     const footer = node("div", "art-card-footer");
     footer.append(feedbackGroup(record));
     const detail = node("button", "detail-link", "Details & feedback ↗");
@@ -232,7 +233,7 @@ function renderDetails(record) {
   const heading = node("h2", "", record.title);
   heading.id = "detailTitle";
   body.append(heading);
-  body.append(node("p", "work-byline", [record.artist, record.date].filter(Boolean).join(" · ")));
+  body.append(node("p", "work-byline", byline(record.artist, record.date)));
   if (record.description) body.append(node("p", "work-description", record.description));
   if (record.relationship) body.append(node("p", "work-description", record.relationship));
   if (record.artworks.length) {
@@ -243,7 +244,7 @@ function renderDetails(record) {
       const linkUrl = safeMuseumLink(art.url);
       const title = linkUrl ? node("a", "", art.title) : node("strong", "", art.title);
       if (linkUrl) { title.href = linkUrl; title.target = "_blank"; title.rel = "noopener noreferrer"; }
-      item.append(title, node("span", "", [art.artist, art.date, art.source].filter(Boolean).join(" · ")));
+      item.append(title, node("span", "", byline(art.artist, art.date, art.source)));
       list.append(item);
     }
     body.append(list);
@@ -264,32 +265,25 @@ function renderDetails(record) {
   content.append(body);
 }
 
+function blacklistChip(label, onRemove) {
+  const chip = node("span", "blacklist-chip", label);
+  const remove = node("button", "", "×");
+  remove.type = "button";
+  remove.title = "Remove " + label + " from blacklist";
+  remove.setAttribute("aria-label", remove.title);
+  remove.addEventListener("click", onRemove);
+  chip.append(remove);
+  return chip;
+}
+
 function renderBlacklist() {
-  const artistList = $("blacklistedArtists");
-  clear(artistList);
-  for (const artist of gallery.blacklisted_artists) {
-    const chip = node("span", "blacklist-chip", artist);
-    const remove = node("button", "", "×");
-    remove.type = "button";
-    remove.title = "Remove " + artist + " from blacklist";
-    remove.setAttribute("aria-label", remove.title);
-    remove.addEventListener("click", () => changeBlacklist("artist", { artist, blocked: false }));
-    chip.append(remove);
-    artistList.append(chip);
-  }
-  const workList = $("blacklistedWorks");
-  clear(workList);
-  for (const art of gallery.blacklisted_artworks) {
-    const chip = node("span", "blacklist-chip", art.title);
-    chip.title = `${art.title} · ${art.artist}`;
-    const remove = node("button", "", "×");
-    remove.type = "button";
-    remove.title = "Remove " + art.title + " from blacklist";
-    remove.setAttribute("aria-label", remove.title);
-    remove.addEventListener("click", () => changeBlacklist("artwork", { id: art.id, blocked: false }));
-    chip.append(remove);
-    workList.append(chip);
-  }
+  $("blacklistedArtists").replaceChildren(...gallery.blacklisted_artists.map((artist) =>
+    blacklistChip(artist, () => changeBlacklist("artist", { artist, blocked: false }))));
+  $("blacklistedWorks").replaceChildren(...gallery.blacklisted_artworks.map((art) => {
+    const chip = blacklistChip(art.title, () => changeBlacklist("artwork", { id: art.id, blocked: false }));
+    chip.title = byline(art.title, art.artist);
+    return chip;
+  }));
   const options = $("artworkOptions");
   clear(options);
   artworkChoices = new Map();

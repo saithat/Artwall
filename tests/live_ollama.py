@@ -23,7 +23,7 @@ class LiveOllamaTests(HomeTest):
         with self.database() as db:
             (composition,) = db.list_compositions()
         self.assertEqual(set(composition.artwork_ids), {"artic:live-left", "artic:live-right"})
-        self.assertIn(composition.decision.layout, ("diptych_50", "diptych_60"))
+        self.assertEqual(composition.decision.layout, "diptych")
         self.assertNotIn("Local model unavailable or invalid", composition.decision.curator_reason)
 
     def test_curates_a_cached_artwork_with_the_real_model(self):

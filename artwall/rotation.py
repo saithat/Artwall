@@ -41,11 +41,13 @@ class Exclusions:
     @classmethod
     def load(cls, db: Database, settings: Settings) -> Exclusions:
         return cls(frozenset(db.flagged_ids("blacklist", "dislike", target_type="artwork")),
-                   frozenset(db.list_blacklisted_artists()), settings.public_lock_screen_safe)
+                   frozenset(name.casefold() for name in db.list_blacklisted_artists()),
+                   settings.public_lock_screen_safe)
 
     def allows(self, artwork: Artwork) -> bool:
+        # Artist names compare without case, as curation's taste scoring does.
         return (artwork.id not in self.artwork_ids
-                and (not artwork.artist or artwork.artist not in self.artists)
+                and (not artwork.artist or artwork.artist.casefold() not in self.artists)
                 and (not self.lock_screen_safe_only or lock_screen_safe(artwork)))
 
 
@@ -164,18 +166,21 @@ def go_back(db: Database, settings: Settings, *, apply: bool = True) -> Composit
 def vote(db: Database, composition: Composition, kind: Vote, *, enabled: bool = True) -> bool:
     """Set or clear a vote; return whether it changed the primary artist's score.
 
-    Like and favorite clear a dislike, and a dislike clears both. The primary
+    Like and favorite clear a dislike, and a dislike clears both. A favorite
+    includes a like, so removing a favorite removes that like too. The primary
     work carries the like or dislike into future curation.
     """
     old = db.get_feedback(composition.id)
     before: dict[Vote, bool] = {flag: old.get(flag, False) for flag in get_args(Vote)}
     after = dict(before)
     if kind == "like":
-        after["like"], after["dislike"], after["favorite"] = enabled, False, before["favorite"] and enabled
+        after.update(like=enabled, dislike=False, favorite=before["favorite"] and enabled)
     elif kind == "dislike":
-        after["like"], after["dislike"], after["favorite"] = False, enabled, False
-    else:
-        after["like"], after["dislike"], after["favorite"] = True, False, enabled
+        after.update(like=False, dislike=enabled, favorite=False)
+    elif enabled:
+        after.update(like=True, dislike=False, favorite=True)
+    elif before["favorite"]:
+        after.update(like=False, favorite=False)
     for flag, value in after.items():
         if value != before[flag]:
             db.set_feedback(composition.id, flag, value)

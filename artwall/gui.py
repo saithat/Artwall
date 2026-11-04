@@ -37,6 +37,7 @@ LOG = logging.getLogger("artwall.gui")
 ASSETS = Path(__file__).parent / "gui_assets"
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 _MAX_BODY = 16_384
+_BATCH = 3  # wallpapers made by one "Prepare new wallpapers" request
 
 
 def _artwork_summary(art: Artwork) -> dict[str, str]:
@@ -147,13 +148,15 @@ class GuiContext:
         with self.preparation_lock:
             if self.preparation_status == "running":
                 return "Already preparing new wallpapers."
+            # -P keeps the working directory off sys.path, so an unrelated
+            # artwall/ folder there can never replace the installed package.
             process = subprocess.Popen(
-                [sys.executable, "-m", "artwall.cli", "curate", "--count", "3", "--next"],
+                [sys.executable, "-P", "-m", "artwall.cli", "curate", "--count", str(_BATCH), "--next"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             )
             self.preparation_status = "running"
             self.prepared_count = 0
-            self.preparation_message = "Preparing 3 wallpapers with your saved settings. This may take a few minutes."
+            self.preparation_message = f"Preparing {_BATCH} wallpapers with your saved settings. This may take a few minutes."
             Thread(target=self._watch_preparation, args=(process,), daemon=True).start()
         return "Preparing new wallpapers. You can keep using the gallery."
 
@@ -164,7 +167,7 @@ class GuiContext:
                 if line.startswith("Queued "):
                     with self.preparation_lock:
                         self.prepared_count += 1
-                        self.preparation_message = f"{self.prepared_count} of 3 wallpapers ready. Still preparing…"
+                        self.preparation_message = f"{self.prepared_count} of {_BATCH} wallpapers ready. Still preparing…"
                 else:
                     LOG.warning("curator: %s", line.rstrip())
         result = process.wait()

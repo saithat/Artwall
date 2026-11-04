@@ -144,9 +144,10 @@ class GalleryTests(HomeTest):
         self.post("/api/blacklist/artwork", {"id": self.art.id, "blocked": True})
         self.assertEqual(queued(), ["same-artist", "other-artist"])
         self.post("/api/blacklist/artwork", {"id": self.art.id, "blocked": False})
-        self.post("/api/blacklist/artist", {"artist": "A Painter", "blocked": True})
+        # Names match regardless of case, as they do during curation.
+        self.post("/api/blacklist/artist", {"artist": "a painter", "blocked": True})
         self.assertEqual(queued(), ["other-artist"])
-        self.post("/api/blacklist/artist", {"artist": "A Painter", "blocked": False})
+        self.post("/api/blacklist/artist", {"artist": "a painter", "blocked": False})
         self.assertEqual(queued(), ["queued", "same-artist", "other-artist"])
 
     def test_disliking_current_retries_a_failed_update_then_moves_one_work(self):
@@ -209,3 +210,28 @@ class GalleryTests(HomeTest):
         self.post("/api/comment", {"id": "current", "comment": " \n "})
         with self.database() as db:
             self.assertEqual(db.curation_feedback(), [])
+
+    def test_removing_a_favorite_also_removes_its_like(self):
+        favorite = {"id": "queued", "kind": "favorite"}
+        self.post("/api/feedback", favorite)
+        self.assertEqual(self.state()["queued"][0]["feedback"], {"like": True, "dislike": False, "favorite": True})
+        self.assertEqual(self.score(), 2)
+        self.post("/api/feedback", favorite)
+        self.assertEqual(self.state()["queued"][0]["feedback"], {"like": False, "dislike": False, "favorite": False})
+        self.assertEqual(self.score(), 0)
+
+    def test_long_feedback_fits_a_prompt_budget_newest_first(self):
+        with self.database() as db:
+            for index in range(8):
+                self.queue(db, f"noted-{index}", self.artwork(f"n{index}"))
+                db.set_comment(f"noted-{index}", f"Note {index}: " + "x" * 790)
+            art = self.artwork("future", (1800, 1400), title="A Museum Title")
+            db.upsert_artwork(art)
+        draft = CuratorDecision("near_single", art.id, (DecisionArtwork(art.id),))
+        with patch("artwall.curation.OllamaCurator._chat", return_value=draft.to_dict()) as chat:
+            self.cli("curate", "--count", "1")
+        selection = chat.call_args_list[0]
+        block = selection.args[0].split("\nViewer feedback: ", 1)[1].split("\nCandidates: ", 1)[0]
+        self.assertLessEqual(len(block), 4000)
+        self.assertTrue(json.loads(block)[0]["comment"].startswith("Note 7:"))
+        self.assertEqual(selection.kwargs["num_ctx"], 16384)

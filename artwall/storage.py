@@ -121,16 +121,25 @@ class Database:
                 )
             version = 2
         if version == 2:
-            with self.connection:
-                self.connection.executescript(
-                    """
-                    ALTER TABLE compositions ADD COLUMN queue_priority REAL NOT NULL DEFAULT 0;
-                    DROP INDEX IF EXISTS idx_compositions_queue;
-                    CREATE INDEX idx_compositions_queue
-                        ON compositions(shown_at, queue_priority DESC, created_at);
-                    PRAGMA user_version = 3;
-                    """
-                )
+            # ALTER TABLE is not idempotent. Take the write lock first and
+            # re-check, so concurrent openers (a login rotation and a timer)
+            # or an interrupted earlier attempt cannot fail every later open.
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(compositions)")}
+                if self.connection.execute("PRAGMA user_version").fetchone()[0] == 2:
+                    if "queue_priority" not in columns:
+                        self.connection.execute(
+                            "ALTER TABLE compositions ADD COLUMN queue_priority REAL NOT NULL DEFAULT 0")
+                    self.connection.execute("DROP INDEX IF EXISTS idx_compositions_queue")
+                    self.connection.execute(
+                        "CREATE INDEX idx_compositions_queue "
+                        "ON compositions(shown_at, queue_priority DESC, created_at)")
+                    self.connection.execute("PRAGMA user_version = 3")
+                self.connection.commit()
+            except BaseException:
+                self.connection.rollback()
+                raise
 
     def close(self) -> None:
         self.connection.close()
