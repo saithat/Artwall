@@ -6,6 +6,7 @@ Nothing here calls a museum or model: rotation only shows what is already render
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import json
 import logging
 from pathlib import Path
@@ -24,6 +25,48 @@ from artwall.storage import Database
 
 LOG = logging.getLogger(__name__)
 Vote = Literal["like", "dislike", "favorite"]
+
+
+class Reaction(Enum):
+    """A composition's single reaction. Its value is the reaction's artist score.
+
+    One state rules out contradictions such as a liked and disliked work. A
+    favorite includes a like.
+    """
+
+    DISLIKED = -1
+    NONE = 0
+    LIKED = 1
+    FAVORITE = 2
+
+    @classmethod
+    def stored(cls, flags: dict[str, bool]) -> Reaction:
+        """Read the reaction from a composition's stored feedback flags."""
+        if flags.get("favorite"):
+            return cls.FAVORITE
+        if flags.get("like"):
+            return cls.LIKED
+        return cls.DISLIKED if flags.get("dislike") else cls.NONE
+
+    def includes(self, kind: Vote) -> bool:
+        match kind:
+            case "like":
+                return self in (Reaction.LIKED, Reaction.FAVORITE)
+            case "favorite":
+                return self is Reaction.FAVORITE
+            case "dislike":
+                return self is Reaction.DISLIKED
+
+    def flags(self) -> dict[Vote, bool]:
+        return {kind: self.includes(kind) for kind in get_args(Vote)}
+
+    def voted(self, kind: Vote, enabled: bool) -> Reaction:
+        """Setting a vote replaces any other; clearing one leaves no reaction."""
+        if enabled == self.includes(kind):
+            return self
+        if not enabled:
+            return Reaction.NONE
+        return {"like": Reaction.LIKED, "favorite": Reaction.FAVORITE, "dislike": Reaction.DISLIKED}[kind]
 
 
 class NoAlternativeError(RuntimeError):
@@ -166,33 +209,19 @@ def go_back(db: Database, settings: Settings, *, apply: bool = True) -> Composit
 def vote(db: Database, composition: Composition, kind: Vote, *, enabled: bool = True) -> bool:
     """Set or clear a vote; return whether it changed the primary artist's score.
 
-    Like and favorite clear a dislike, and a dislike clears both. A favorite
-    includes a like, so removing a favorite removes that like too. The primary
-    work carries the like or dislike into future curation.
+    The primary work carries the like or dislike into future curation.
     """
-    old = db.get_feedback(composition.id)
-    before: dict[Vote, bool] = {flag: old.get(flag, False) for flag in get_args(Vote)}
-    after = dict(before)
-    if kind == "like":
-        after.update(like=enabled, dislike=False, favorite=before["favorite"] and enabled)
-    elif kind == "dislike":
-        after.update(like=False, dislike=enabled, favorite=False)
-    elif enabled:
-        after.update(like=True, dislike=False, favorite=True)
-    elif before["favorite"]:
-        after.update(like=False, favorite=False)
-    for flag, value in after.items():
-        if value != before[flag]:
+    stored = db.get_feedback(composition.id)
+    before = Reaction.stored(stored)
+    after = before.voted(kind, enabled)
+    for flag, value in after.flags().items():
+        if value != stored.get(flag, False):
             db.set_feedback(composition.id, flag, value)
-
-    def score(flags: dict[Vote, bool]) -> int:
-        return int(flags["like"]) + int(flags["favorite"]) - int(flags["dislike"])
-
-    delta = score(after) - score(before)
+    delta = after.value - before.value
     art = db.get_artwork(composition.decision.primary_artwork_id)
     if art:
-        db.set_feedback(art.id, "like", after["like"], target_type="artwork")
-        db.set_feedback(art.id, "dislike", after["dislike"], target_type="artwork")
+        db.set_feedback(art.id, "like", after.includes("like"), target_type="artwork")
+        db.set_feedback(art.id, "dislike", after.includes("dislike"), target_type="artwork")
         if art.artist and delta:
             db.adjust_artist_score(art.artist, delta)
     return delta != 0

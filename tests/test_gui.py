@@ -211,14 +211,17 @@ class GalleryTests(HomeTest):
         with self.database() as db:
             self.assertEqual(db.curation_feedback(), [])
 
-    def test_removing_a_favorite_also_removes_its_like(self):
-        favorite = {"id": "queued", "kind": "favorite"}
-        self.post("/api/feedback", favorite)
-        self.assertEqual(self.state()["queued"][0]["feedback"], {"like": True, "dislike": False, "favorite": True})
-        self.assertEqual(self.score(), 2)
-        self.post("/api/feedback", favorite)
-        self.assertEqual(self.state()["queued"][0]["feedback"], {"like": False, "dislike": False, "favorite": False})
-        self.assertEqual(self.score(), 0)
+    def test_reactions_are_exclusive_and_a_favorite_includes_a_like(self):
+        # Each press toggles one vote; a thumbs down also drops the work from the queue.
+        steps = [("favorite", "like favorite", 2), ("like", "", 0), ("dislike", "dislike", -1),
+                 ("like", "like", 1), ("favorite", "like favorite", 2), ("favorite", "", 0)]
+        for kind, shown, score in steps:
+            with self.subTest(kind=kind, shown=shown):
+                self.post("/api/feedback", {"id": "queued", "kind": kind})
+                with self.database() as db:
+                    feedback = db.get_feedback("queued")
+                self.assertEqual({flag for flag, on in feedback.items() if on}, set(shown.split()))
+                self.assertEqual(self.score(), score)
 
     def test_long_feedback_fits_a_prompt_budget_newest_first(self):
         with self.database() as db:

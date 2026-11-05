@@ -51,7 +51,7 @@ def _record_summary(db: Database, composition: Composition) -> dict[str, Any]:
                 if (art := db.get_artwork(artwork_id))]
     primary = next((art for art in artworks if art["id"] == decision.primary_artwork_id),
                    artworks[0] if artworks else None)
-    flags = db.get_feedback(composition.id)
+    reaction = rotation.Reaction.stored(db.get_feedback(composition.id))
     return {"id": composition.id, "artworks": artworks,
             "primary_artwork_id": primary["id"] if primary else None,
             "title": primary["title"] if primary else "Untitled composition",
@@ -60,7 +60,7 @@ def _record_summary(db: Database, composition: Composition) -> dict[str, Any]:
             "description": decision.description, "relationship": decision.relationship,
             "layout": decision.layout, "created_at": composition.created_at, "shown_at": composition.shown_at,
             "image": f"/image/{composition.id}", "thumbnail": f"/thumb/{composition.id}",
-            "feedback": {kind: flags.get(kind, False) for kind in ("like", "dislike", "favorite")},
+            "feedback": reaction.flags(),
             "comment": db.get_comment(composition.id)}
 
 
@@ -93,7 +93,7 @@ def vote_from_gallery(db: Database, config_file: Path, composition_id: str, kind
     is_current = current is not None and current.id == composition_id
     if kind == "dislike" and expected_current == composition_id and not is_current:
         return "The wallpaper has already changed."
-    was_set = db.get_feedback(composition_id).get(kind, False)
+    was_set = rotation.Reaction.stored(db.get_feedback(composition_id)).includes(kind)
     # A rejected work can remain on screen when no alternative is cached or
     # the desktop backend fails. Pressing thumbs down again retries the change.
     enabled = (kind == "dislike" and is_current) or not was_set
