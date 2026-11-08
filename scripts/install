@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Install artwall for this user in a virtual environment that can see the system's
+# PyGObject, GTK 4, and libadwaita (PyGObject does not build cleanly from PyPI).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+venv=${ARTWALL_VENV:-${XDG_DATA_HOME:-$HOME/.local/share}/artwall-venv}
+bin=${ARTWALL_BIN:-$HOME/.local/bin}
+
+if ! /usr/bin/python3 -c 'import gi; gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1")' 2>/dev/null; then
+    echo "Note: the system Python lacks PyGObject, GTK 4, or libadwaita; the app (artwall gui) will not start." >&2
+    echo "      Fedora: sudo dnf install python3-gobject gtk4 libadwaita" >&2
+    echo "      Debian/Ubuntu: sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1" >&2
+    echo "      Arch: sudo pacman -S python-gobject gtk4 libadwaita" >&2
+fi
+/usr/bin/python3 -m venv --system-site-packages "$venv"
+"$venv/bin/python" -m pip install --quiet --upgrade --editable .
+mkdir -p "$bin"
+ln -sf "$venv/bin/artwall" "$bin/artwall"
+echo "Installed $bin/artwall"
+"$bin/artwall" install-launcher
+if [ -e "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/artwall-rotate.timer" ]; then
+    "$bin/artwall" install-timers  # Point existing timers at this installation.
+fi

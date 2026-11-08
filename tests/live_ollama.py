@@ -2,7 +2,9 @@
 
 Ollama by default. For an OpenAI-compatible server set ARTWALL_TEST_PROVIDER=openai,
 ARTWALL_TEST_MODEL_URL (including /v1), and ARTWALL_TEST_MODEL; a key is read from
-OPENAI_API_KEY when the server needs one.
+OPENAI_API_KEY when the server needs one. For a signed-in agent CLI set
+ARTWALL_TEST_PROVIDER=agent, ARTWALL_TEST_AGENT (claude or codex), and
+ARTWALL_TEST_MODEL="" for its default model.
 """
 
 import json
@@ -17,8 +19,9 @@ def _llm_config() -> str:
     provider = os.environ.get("ARTWALL_TEST_PROVIDER", "ollama")
     model = os.environ.get("ARTWALL_TEST_MODEL", "qwen3.6:27b")
     base_url = os.environ.get("ARTWALL_TEST_MODEL_URL", os.environ.get("ARTWALL_TEST_OLLAMA_URL", "http://127.0.0.1:11434"))
+    agent = os.environ.get("ARTWALL_TEST_AGENT", "claude")
     return (f"[llm]\nprovider = {json.dumps(provider)}\nmodel = {json.dumps(model)}\n"
-            f"base_url = {json.dumps(base_url)}\n")
+            f"base_url = {json.dumps(base_url)}\nagent = {json.dumps(agent)}\n")
 
 
 class LiveOllamaTests(HomeTest):

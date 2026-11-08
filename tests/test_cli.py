@@ -11,7 +11,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageOps, ImageStat
 
 from artwall import cli
 from artwall.config import database_path
-from artwall.models import CuratorDecision, DecisionArtwork, arrangement_from_layout
+from artwall.models import CuratorDecision, DecisionArtwork, Whole, arrangement_from_layout
 from artwall.storage import Database
 from tests.support import HomeTest
 
@@ -103,6 +103,55 @@ class CliTests(HomeTest):
                 (self.bin_dir / command).unlink()
         self.config_file.unlink()
         self.assertIn("Display: 1920 × 1080 (not detected", self.cli("init"))
+
+    def test_signed_in_agent_cli_curates_without_an_api_key(self):
+        art = self.artwork("agent", (1800, 1400), title="Harbor at Dusk", artist="An Etcher",
+                           museum_description="Boats rest in a quiet harbor beneath a low evening sky while "
+                                              "lamps glow along the pier and gulls circle above the dark water.")
+        with self.database() as db:
+            db.upsert_artwork(art)
+        answer = CuratorDecision(Whole(DecisionArtwork(art.id)), description=art.museum_description,
+                                 curator_reason="Calm harbor.").to_dict()
+        events = [{"type": "system", "subtype": "init", "tools": []},
+                  {"type": "result", "subtype": "success", "is_error": False, "result": json.dumps(answer)}]
+        self.fake_command("claude", "\n".join(json.dumps(event) for event in events) + "\n", capture_stdin=True)
+        self.configure('[llm]\nprovider = "agent"\nagent = "claude"\nmodel = ""\n')
+        self.cli("curate", "--count", "1")
+        with self.database() as db:
+            (composition,) = db.list_compositions(only_unshown=True)
+        self.assertNotIn("unavailable or invalid", composition.decision.curator_reason)
+        (call, *_) = [line for line in self.commands() if line.startswith("claude ")]
+        # No tools, MCP servers, user settings, or saved session; no --model when left empty.
+        self.assertIn('--tools  --strict-mcp-config --setting-sources  --no-session-persistence', call)
+        self.assertNotIn("--model", call)
+        message = json.loads((self.bin_dir / "claude.stdin").read_text().splitlines()[0])
+        kinds = [block["type"] for block in message["message"]["content"]]
+        self.assertEqual(kinds, ["text", "image"])
+
+        # Any other CLI: the prompt on stdin, {image} replaced, and an answer wrapped in prose.
+        other = self.artwork("agent-2", (1800, 1400), title="Quiet Bay", museum_description=art.museum_description)
+        with self.database() as db:
+            db.upsert_artwork(other)
+        answer = CuratorDecision(Whole(DecisionArtwork(other.id)), description=art.museum_description).to_dict()
+        self.fake_command("my-agent", "Here is my choice:\n" + json.dumps(answer) + "\nEnjoy!")
+        self.configure('[llm]\nprovider = "agent"\nagent = "command"\nmodel = ""\n'
+                       'agent_command = ["my-agent", "--attach", "{image}"]\n')
+        self.cli("curate", "--count", "1")
+        with self.database() as db:
+            queued = [c for c in db.list_compositions(only_unshown=True) if other.id in c.artwork_ids]
+        self.assertEqual(len(queued), 1)
+        self.assertNotIn("unavailable or invalid", queued[0].decision.curator_reason)
+        self.assertTrue(any(line.startswith("my-agent --attach /") and line.endswith("contact-sheet.jpg")
+                            for line in self.commands()))
+
+    def test_install_launcher_adds_the_app_to_the_launcher(self):
+        self.assertIn("app launcher", self.cli("install-launcher"))
+        applications = self.root / "data" / "applications"
+        entry = (applications / "io.github.saithat.Artwall.desktop").read_text()
+        self.assertIn(f"Exec={self.bin_dir / 'artwall'} gui\n", entry)
+        self.assertIn("Icon=io.github.saithat.Artwall\n", entry)
+        icon = self.root / "data" / "icons" / "hicolor" / "scalable" / "apps" / "io.github.saithat.Artwall.svg"
+        self.assertTrue(icon.read_text().startswith("<svg"))
 
     def test_content_filters_apply_to_curation_and_prepared_wallpapers(self):
         self.configure("[lockscreen]\npublic_lock_screen_safe = true\n")

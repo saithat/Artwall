@@ -10,8 +10,10 @@ RUN dnf -y --setopt=install_weak_deps=False --setopt=optional_metadata_types=fil
         /usr/bin/kwriteconfig6 /usr/bin/kreadconfig6 \
         /usr/bin/sway /usr/bin/swaybg /usr/bin/swaymsg \
         /usr/bin/Xvfb /usr/bin/xrandr /usr/bin/feh \
+        python3-gobject gobject-introspection gtk4 libadwaita adwaita-icon-theme /usr/bin/grim /usr/bin/gdbus \
+        google-noto-sans-fonts google-noto-serif-fonts \
     && dnf clean all
-ENV PYTHONDONTWRITEBYTECODE=1 XDG_RUNTIME_DIR=/run/artwall-xdg
+ENV PYTHONDONTWRITEBYTECODE=1 XDG_RUNTIME_DIR=/run/artwall-xdg GSK_RENDERER=cairo
 RUN mkdir -m 700 /run/artwall-xdg
 WORKDIR /src
 CMD ["dbus-run-session", "--", "bash", "tests/desktops/run.sh"]

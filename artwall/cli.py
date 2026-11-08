@@ -23,6 +23,7 @@ from artwall.config import (
 )
 from artwall.curation import ModelCurator, Taste, choose_composition, score_candidate
 from artwall.desktop import detect_display_size, lock_screen_backend_name, wallpaper_backend_name
+from artwall.launcher import install_launcher
 from artwall.models import Artwork, Composition, CuratorDecision
 from artwall.render import RenderResult, RenderSettings, render_wallpaper
 from artwall.sources.artic import ArticSource
@@ -202,7 +203,8 @@ def cmd_curate(args: argparse.Namespace, settings: Settings) -> None:
     if not 1 <= count <= 30:
         raise ValueError("Count must be between 1 and 30")
     curator = (ModelCurator(settings.model, settings.model_url, description_words=settings.caption_words,
-                            provider=settings.model_provider, api_key=model_api_key(settings))
+                            provider=settings.model_provider, api_key=model_api_key(settings),
+                            agent=settings.agent, agent_command=settings.agent_command)
                if settings.use_local_model and not args.offline else None)
     created = 0
     started = time.time()
@@ -361,11 +363,15 @@ def cmd_render(args: argparse.Namespace, settings: Settings) -> None:
         print(_render(db, composition.decision, settings, output).path)
 
 
-def cmd_install_timers(args: argparse.Namespace, settings: Settings) -> None:
+def _executable() -> str:
     executable = shutil.which("artwall")
     if not executable:
-        raise RuntimeError("Install the artwall CLI first (for example: uv tool install --editable .)")
-    for path in write_units(settings, user_unit_dir(), str(Path(executable).resolve())):
+        raise RuntimeError("Install the artwall command first (see README: Install)")
+    return str(Path(executable).resolve())
+
+
+def cmd_install_timers(args: argparse.Namespace, settings: Settings) -> None:
+    for path in write_units(settings, user_unit_dir(), _executable()):
         print(path)
     if not args.no_enable:
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
@@ -379,9 +385,15 @@ def cmd_install_timers(args: argparse.Namespace, settings: Settings) -> None:
 
 
 def cmd_gui(args: argparse.Namespace, settings: Settings) -> None:
-    from artwall.gui import run_gui
+    from artwall.app import run
 
-    run_gui(args.port, open_browser=not args.no_open)
+    run([sys.argv[0]])
+
+
+def cmd_install_launcher(args: argparse.Namespace, settings: Settings) -> None:
+    for path in install_launcher(_executable()):
+        print(path)
+    print("Artwall is in your app launcher.")
 
 
 _COMMANDS: dict[str, tuple[Handler, str]] = {
@@ -406,7 +418,8 @@ _COMMANDS: dict[str, tuple[Handler, str]] = {
     "refresh": (cmd_refresh, "refresh museum metadata"),
     "curate": (cmd_curate, "prepare future wallpapers"),
     "install-timers": (cmd_install_timers, "install and enable user timers"),
-    "gui": (cmd_gui, "open the local gallery and settings"),
+    "gui": (cmd_gui, "open the Artwall app"),
+    "install-launcher": (cmd_install_launcher, "add the Artwall app to your app launcher"),
 }
 
 
@@ -441,9 +454,6 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("artist", nargs="?", help="defaults to the current primary artist")
         if name == "install-timers":
             command.add_argument("--no-enable", action="store_true", help="write units without enabling timers")
-        if name == "gui":
-            command.add_argument("--port", type=int, default=8765, help="localhost port (default: 8765)")
-            command.add_argument("--no-open", action="store_true", help="do not open a browser automatically")
     return parser
 
 

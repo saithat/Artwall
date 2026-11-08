@@ -22,7 +22,9 @@ museum facts authoritative, and rotation usable without a network or model.
 - `artwall/desktop/`: wallpaper, lock-screen, and display-size adapters per desktop.
 - `artwall/config.py`: TOML configuration and validation.
 - `artwall/cli.py`: command orchestration; keep substantial logic in modules.
-- `artwall/gui.py` and `artwall/gui_assets/`: local gallery API and interface.
+- `artwall/gallery.py`: the app's behavior (state, votes, settings, exclusions, preparation), toolkit-free.
+- `artwall/app/`: the GTK 4 / libadwaita window, a thin view over `gallery.py`.
+- `artwall/launcher.py`: the desktop entry and icon.
 - `tests/`: offline contract and behavior tests.
 
 ## Contracts to preserve
@@ -37,7 +39,7 @@ museum facts authoritative, and rotation usable without a network or model.
 - Platform-specific wallpaper, lock-screen, and scheduling behavior belongs
   behind adapters. Do not introduce a desktop-environment or systemd dependency into the
   source, curation, storage, or rendering modules.
-- Default tests are end-to-end scenarios through the CLI and gallery server,
+- Default tests are end-to-end scenarios through the CLI and gallery service,
   in a temporary home with fake desktop commands on PATH (`tests/support.py`).
   Network, Ollama, and desktop commands are not prerequisites for `scripts/check`.
   The explicit `scripts/check-model` uses a real vision model, and

@@ -24,3 +24,8 @@ packages = ["artwall"]
 files = ["artwall"]
 strict = true
 python_version = "3.11"
+
+# PyGObject comes from the system and ships no type information.
+[[tool.mypy.overrides]]
+module = ["gi", "gi.*"]
+ignore_missing_imports = true

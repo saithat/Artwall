@@ -23,8 +23,12 @@ def config_path() -> Path:
     return config_home() / "artwall" / "config.toml"
 
 
+def data_home() -> Path:
+    return _xdg("XDG_DATA_HOME", ".local/share")
+
+
 def data_dir() -> Path:
-    return _xdg("XDG_DATA_HOME", ".local/share") / "artwall"
+    return data_home() / "artwall"
 
 
 def cache_dir() -> Path:
@@ -65,6 +69,8 @@ class Settings:
     model_url: str = "http://127.0.0.1:11434"
     api_key_env: str = "OPENAI_API_KEY"
     api_key_file: str | None = None
+    agent: str = "claude"
+    agent_command: tuple[str, ...] = ()
     use_local_model: bool = True
     curation_batch_size: int = 14
     candidate_pool_size: int = 30
@@ -89,9 +95,10 @@ class Settings:
             (1 <= self.candidate_pool_size <= 100, "candidate_pool_size must be from 1 to 100"),
             (self.public_domain_only, "This release only accepts public-domain museum images"),
             (20 <= self.caption_words <= 50, "description_words must be from 20 to 50"),
-            (not self.use_local_model or bool(self.model.strip()),
-             "An enabled local model needs a nonempty model name"),
-            (self.model_provider in {"ollama", "openai"}, 'llm.provider must be "ollama" or "openai"'),
+            (not self.use_local_model or self.model_provider == "agent" or bool(self.model.strip()),
+             "An enabled model needs a nonempty model name"),
+            (self.model_provider in {"ollama", "openai", "agent"}, 'llm.provider must be "ollama", "openai", or "agent"'),
+            (self.agent in {"claude", "codex", "command"}, 'llm.agent must be "claude", "codex", or "command"'),
             (0 <= self.explore_fraction and 0 <= self.wildcard_fraction
              and self.explore_fraction + self.wildcard_fraction < 1,
              "Exploration fractions must be non-negative and sum to less than 1"),
@@ -126,6 +133,8 @@ _OPTIONS: dict[str, tuple[str, str, type]] = {
     "model_url": ("llm", "base_url", str),
     "api_key_env": ("llm", "api_key_env", str),
     "api_key_file": ("llm", "api_key_file", str),
+    "agent": ("llm", "agent", str),
+    "agent_command": ("llm", "agent_command", tuple),
 }
 
 

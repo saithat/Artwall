@@ -27,6 +27,7 @@ from artwall.storage import Database
 _FAKE_COMMAND = """#!/bin/sh
 if [ -e "{down}" ]; then echo "ERROR: no DMS session"; exit 0; fi
 printf '%s\\n' "{name} $*" >> "{log}"
+if [ -e "$0.capture" ]; then while IFS= read -r line || [ -n "$line" ]; do printf '%s\\n' "$line" >> "$0.stdin"; done; fi
 if [ -e "$0.out" ]; then while IFS= read -r line || [ -n "$line" ]; do printf '%s\\n' "$line"; done < "$0.out"; fi
 """
 
@@ -58,13 +59,15 @@ class HomeTest(unittest.TestCase):
         self.configure()
         self.clock = 0.0
 
-    def fake_command(self, name: str, output: str = "") -> None:
-        """Put a logging command on PATH that prints ``output``."""
+    def fake_command(self, name: str, output: str = "", *, capture_stdin: bool = False) -> None:
+        """Put a logging command on PATH that prints ``output`` and can save its stdin to NAME.stdin."""
         script = self.bin_dir / name
         script.write_text(_FAKE_COMMAND.format(name=name, down=self.desktop_down, log=self.commands_log))
         script.chmod(0o755)
         if output:
             (self.bin_dir / f"{name}.out").write_text(output)
+        if capture_stdin:
+            (self.bin_dir / f"{name}.capture").touch()
 
     def configure(self, extra: str = "") -> None:
         self.config_file.write_text(self.config + extra)

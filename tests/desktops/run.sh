@@ -16,5 +16,7 @@ for _ in $(seq 50); do
 done
 if [ -z "${sock:-}" ]; then cat /tmp/sway.log; exit 1; fi
 export ARTWALL_TEST_SWAYSOCK=$sock
+wayland=$(cd "$XDG_RUNTIME_DIR" && ls wayland-* | grep -v lock | head -1)
+export ARTWALL_TEST_WAYLAND_DISPLAY=$wayland
 
 python3 -m unittest tests.live_desktops -v

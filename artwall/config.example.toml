@@ -34,10 +34,14 @@ show_medium = false
 
 [llm]
 enabled = true
-provider = "ollama" # or "openai" for any OpenAI-compatible /chat/completions API.
+provider = "ollama" # "openai" for any OpenAI-compatible API, or "agent" for a signed-in agent CLI.
 model = "qwen3.6:27b" # A vision model the endpoint serves.
 base_url = "http://127.0.0.1:11434" # For "openai", include /v1, e.g. "https://api.openai.com/v1".
 # The API key is read from this environment variable, or from api_key_file if set.
 # Local servers such as llama.cpp, vLLM, or LM Studio usually need no key.
 api_key_env = "OPENAI_API_KEY"
 # api_key_file = "~/.config/artwall/api_key"
+# provider = "agent" uses an agent CLI and the subscription it is signed in with; no API key.
+# agent = "claude"  # Claude Code; or "codex", or "command" with agent_command below.
+# model = ""        # Empty uses the agent's default model.
+# agent_command = ["my-agent", "--image", "{image}"]  # The prompt arrives on stdin; stdout is the answer.

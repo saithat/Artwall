@@ -9,7 +9,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import subprocess
+import sys
+import time
 from unittest.mock import patch
+
+from PIL import Image, ImageDraw
 
 from artwall.desktop import lock_screen_backend
 from tests.support import HomeTest
@@ -106,3 +110,56 @@ class LiveDesktopTests(HomeTest):
         self.config_file.unlink()
         with patch.dict(os.environ, x11):
             self.assertIn("Display: 1600 × 900 (detected)", self.cli("init"))
+
+    def test_native_app_opens_each_page_and_dialog(self):
+        """Start the GTK app under headless Sway; with ARTWALL_SCREENSHOTS set, save each view."""
+        self.config = "[display]\nwidth = 1920\nheight = 1080\n[llm]\nenabled = false\n"
+        self.configure()
+        with self.database() as db:
+            for index, (size, title) in enumerate((((1800, 1200), "Harbor at Dusk"), ((1200, 1500), "Study of Clouds"),
+                                                   ((1600, 1100), "Mountain Path"))):
+                art = self.artwork(f"app-{index}", size, title=title, artist="Jane Etcher", date_display="1821",
+                                   canonical_url=f"https://www.artic.edu/artworks/{index}",
+                                   museum_description="A pale sun hangs over dark water while two small boats rest "
+                                                      "near the far bank and clouds drift across a wide sky.")
+                with Image.open(art.cached_image_path) as source:
+                    image = source.copy()
+                draw = ImageDraw.Draw(image)
+                draw.rectangle((0, size[1] * 2 // 3, size[0], size[1]), fill=(40, 70, 95 + 30 * index))
+                draw.ellipse((size[0] // 2 - 120, 120, size[0] // 2 + 120, 360), fill=(235, 205, 135))
+                image.save(art.cached_image_path)
+                db.upsert_artwork(art)
+        self.cli("curate", "--offline", "--count", "3")
+        self.cli("next", "--no-apply")
+        self.cli("next", "--no-apply")
+        self.cli("like")  # Shows a chosen reaction in the screenshots.
+        session = {"WAYLAND_DISPLAY": os.environ["ARTWALL_TEST_WAYLAND_DISPLAY"],
+                   "SWAYSOCK": os.environ["ARTWALL_TEST_SWAYSOCK"], "XDG_CURRENT_DESKTOP": "sway"}
+        environment = {**os.environ, **session, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+        app = subprocess.Popen([sys.executable, "-P", "-m", "artwall.cli", "gui"], env=environment,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(app.kill)
+        deadline = time.monotonic() + 20
+        while "io.github.saithat.Artwall" not in subprocess.run(
+                ["swaymsg", "-t", "get_tree"], env=environment, capture_output=True, text=True).stdout:
+            if app.poll() is not None or time.monotonic() > deadline:
+                app.kill()
+                self.fail("The app window did not appear:\n" + (app.communicate()[0] or ""))
+            time.sleep(0.2)
+        window = ["gdbus", "call", "--session", "--dest", "io.github.saithat.Artwall",
+                  "--object-path", "/io/github/saithat/Artwall/window/1", "--method", "org.gtk.Actions.Activate"]
+        shots = os.environ.get("ARTWALL_SCREENSHOTS")
+        views = (("now", None), ("next", "'next'"), ("seen", "'seen'"), ("preferences", None))
+        for name, page in views:
+            if name == "preferences":
+                subprocess.run([*window, "preferences", "[]", "{}"], check=True, env=environment, capture_output=True)
+            elif page:
+                subprocess.run([*window, "show-page", f"[<{page}>]", "{}"], check=True, env=environment,
+                               capture_output=True)
+            time.sleep(1.5)
+            self.assertIsNone(app.poll(), "The app exited while switching views")
+            if shots:
+                subprocess.run(["grim", f"{shots}/{name}.png"], check=True, env=environment)
+        app.terminate()
+        output = app.communicate(timeout=10)[0]
+        self.assertNotIn("Traceback", output, output)

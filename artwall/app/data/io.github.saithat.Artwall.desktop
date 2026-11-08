@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Artwall
+GenericName=Art Wallpaper Curator
+Comment=Browse your museum wallpaper rotation and learn about the art
+Exec=artwall gui
+Icon=io.github.saithat.Artwall
+Terminal=false
+Categories=Graphics;Viewer;GTK;
+Keywords=wallpaper;art;museum;gallery;painting;
+StartupNotify=true

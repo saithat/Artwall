@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Artwall Gallery
-Comment=Browse your wallpaper rotation and tune your local museum curator
-Exec=artwall gui
-Icon=applications-graphics
-Terminal=false
-Categories=Graphics;
-Keywords=wallpaper;art;museum;gallery;

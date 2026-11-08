@@ -1,22 +1,17 @@
-"""End-to-end gallery scenarios over real loopback HTTP."""
+"""Gallery scenarios through the toolkit-independent service the native app uses."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import time
 from typing import Any
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
 from unittest.mock import patch
 
 from hypothesis import example, given, settings, strategies as st
 
-from artwall.config import config_path, data_dir, database_path
-from artwall.gui import GuiContext, create_server
+from artwall.gallery import Gallery, Preparation, Record
 from artwall.models import CuratorDecision, DecisionArtwork, Whole
 from artwall.systemd import user_unit_dir
 from tests.support import HomeTest
-
-DISLIKE_CURRENT = {"id": "current", "kind": "dislike", "current_id": "current"}
 
 
 class GalleryTests(HomeTest):
@@ -30,44 +25,25 @@ class GalleryTests(HomeTest):
             for identifier in ("current", "queued"):
                 self.queue(db, identifier, self.art, description="A lighthouse rises above the sea.")
             db.mark_shown("current")
-        context = GuiContext(database_path(), data_dir(), config_path(), user_unit_dir())
-        self.base = self.serve(create_server(context, 0))
-        self.token = ""
-        self.token = self.state()["csrf_token"]
+        self.gallery = Gallery()
 
-    def call(self, path: str, payload: Any = None, headers: dict[str, str] | None = None) -> tuple[int, bytes]:
-        request = Request(self.base + path, headers={"X-Artwall-Token": self.token, **(headers or {})})
-        if payload is not None:
-            request.data = json.dumps(payload).encode()
-            request.add_header("Content-Type", "application/json")
-        try:
-            with urlopen(request, timeout=10) as response:
-                return response.status, response.read()
-        except HTTPError as error:
-            with error:
-                return error.code, error.read()
+    def current(self) -> Record:
+        current = self.gallery.state().current
+        assert current is not None
+        return current
 
-    def state(self) -> dict[str, Any]:
-        status, body = self.call("/api/state")
-        self.assertEqual(status, 200)
-        return json.loads(body)
-
-    def post(self, path: str, payload: dict[str, Any]) -> str:
-        status, body = self.call(path, payload)
-        self.assertEqual(status, 200, body)
-        return json.loads(body)["notice"]
+    def queued(self) -> list[str]:
+        return [record.id for record in self.gallery.state().queued]
 
     def score(self) -> int:
         with self.database() as db:
             return db.get_artist_preference("A Painter").score
 
-    def wait_for_preparation(self) -> dict[str, Any]:
+    def wait_for_preparation(self) -> Preparation:
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            status, body = self.call("/api/preparation")
-            self.assertEqual(status, 200)
-            preparation = json.loads(body)
-            if preparation["status"] != "running":
+            preparation = self.gallery.preparation()
+            if preparation.status != "running":
                 return preparation
             time.sleep(0.05)
         self.fail("Gallery preparation did not finish")
@@ -86,31 +62,31 @@ class GalleryTests(HomeTest):
             db.connection.execute("ALTER TABLE compositions DROP COLUMN queue_priority")
             db.connection.execute("PRAGMA user_version = 2")
             db.connection.commit()
-        self.assertIn("Preparing", self.post("/api/curate", {}))
+        self.assertIn("Preparing", self.gallery.start_preparation())
+        self.assertIn("Already preparing", self.gallery.start_preparation())
         preparation = self.wait_for_preparation()
-        self.assertEqual((preparation["status"], preparation["prepared"]), ("ready", 3), preparation)
-        state = self.state()
-        self.assertEqual(state["current"]["id"], "current")
-        self.assertEqual(state["current"]["comment"], "Keep the original paper margins.")
-        self.assertTrue(state["current"]["feedback"]["favorite"])
-        self.assertEqual(len(state["queued"]), 4)
-        self.assertEqual(state["queued"][-1]["id"], "queued")
+        self.assertEqual((preparation.status, preparation.prepared), ("ready", 3), preparation)
+        current = self.current()
+        self.assertEqual((current.id, current.comment), ("current", "Keep the original paper margins."))
+        self.assertTrue(current.reaction.includes("favorite"))
+        self.assertEqual(len(self.queued()), 4)
+        self.assertEqual(self.queued()[-1], "queued")
         with self.database() as db:
             new = db.list_compositions(only_unshown=True)[:3]
             self.assertTrue(all(len(c.artwork_ids) == 2 for c in new))
         self.assertEqual(self.commands(), [])  # Preparation never changes the desktop.
         for composition in new:
             self.cli("next", "--no-apply")
-            self.assertEqual(self.state()["current"]["id"], composition.id)
+            self.assertEqual(self.current().id, composition.id)
         self.cli("next", "--no-apply")
-        self.assertEqual(self.state()["current"]["id"], "queued")
+        self.assertEqual(self.current().id, "queued")
 
     def test_failed_preparation_keeps_the_existing_queue_available(self):
         self.config_file.write_text(self.config.replace("[llm]\n", "[llm]\nenabled = false\n"))
-        self.post("/api/curate", {})
+        self.gallery.start_preparation()
         preparation = self.wait_for_preparation()
-        self.assertEqual((preparation["status"], preparation["prepared"]), ("error", 0), preparation)
-        self.assertEqual([c["id"] for c in self.state()["queued"]], ["queued"])
+        self.assertEqual((preparation.status, preparation.prepared), ("error", 0), preparation)
+        self.assertEqual(self.queued(), ["queued"])
         self.assertEqual(self.commands(), [])
 
     @settings(max_examples=12, database=None, deadline=None, derandomize=True)
@@ -123,34 +99,40 @@ class GalleryTests(HomeTest):
         if not timer.exists():
             self.cli("install-timers", "--no-enable")
         config = self.config_file.read_text()
-        before = self.state()["settings"]
-        status, _ = self.call("/api/settings", {"interval_minutes": interval, "model": model, "max_artworks": 2})
-        self.assertEqual(self.config_file.read_text(), config)  # The gallery never rewrites config.toml.
-        if not 15 <= interval <= 1440:
-            self.assertEqual((status, self.state()["settings"]), (400, before))
+        before = self.gallery.settings()
+        try:
+            self.gallery.save_settings(interval_minutes=interval, model=model, max_artworks=2)
+        except ValueError:
+            self.assertFalse(15 <= interval <= 1440)
+            self.assertEqual(self.gallery.settings(), before)
             return
-        self.assertEqual(status, 200)
-        saved = self.state()["settings"]
-        self.assertEqual((saved["interval_minutes"], saved["model"], saved["max_artworks"]),
-                         (interval, model.strip(), 2))
+        self.assertEqual(self.config_file.read_text(), config)  # The gallery never rewrites config.toml.
+        saved = self.gallery.settings()
+        self.assertEqual((saved.interval_minutes, saved.model, saved.max_artworks), (interval, model.strip(), 2))
         self.assertIn(f"OnUnitActiveSec={interval}min", timer.read_text())
         # Commands see the saved values too, over config.toml.
         self.assertIn(f"interval_minutes = {interval}", self.cli("status"))
 
-    def test_artwork_and_artist_blacklists_filter_independently(self):
+    def test_artwork_and_artist_exclusions_filter_independently(self):
         with self.database() as db:
             self.queue(db, "same-artist", self.artwork("11", artist="A Painter"))
             self.queue(db, "other-artist", self.artwork("12", artist="Another Painter"))
-        queued = lambda: [item["id"] for item in self.state()["queued"]]
-        self.assertEqual(queued(), ["queued", "same-artist", "other-artist"])
-        self.post("/api/blacklist/artwork", {"id": self.art.id, "blocked": True})
-        self.assertEqual(queued(), ["same-artist", "other-artist"])
-        self.post("/api/blacklist/artwork", {"id": self.art.id, "blocked": False})
+        self.assertEqual(self.queued(), ["queued", "same-artist", "other-artist"])
+        self.gallery.set_artwork_blocked(self.art.id, True)
+        self.assertEqual(self.queued(), ["same-artist", "other-artist"])
+        self.assertEqual([work.id for work in self.gallery.state().blocked_works], [self.art.id])
+        self.gallery.set_artwork_blocked(self.art.id, False)
         # Names match regardless of case, as they do during curation.
-        self.post("/api/blacklist/artist", {"artist": "a painter", "blocked": True})
-        self.assertEqual(queued(), ["other-artist"])
-        self.post("/api/blacklist/artist", {"artist": "a painter", "blocked": False})
-        self.assertEqual(queued(), ["queued", "same-artist", "other-artist"])
+        self.gallery.set_artist_blocked("a painter", True)
+        self.assertEqual(self.queued(), ["other-artist"])
+        self.gallery.set_artist_blocked("a painter", False)
+        self.assertEqual(self.queued(), ["queued", "same-artist", "other-artist"])
+        for change in (lambda: self.gallery.set_artist_blocked("  ", True),
+                       lambda: self.gallery.set_artwork_blocked("artic:missing", True),
+                       lambda: self.gallery.vote("missing", "like"),
+                       lambda: self.gallery.set_comment("missing", "note")):
+            with self.assertRaises(ValueError):
+                change()
 
     def test_disliking_current_retries_a_failed_update_then_moves_one_work(self):
         with self.database() as db:
@@ -158,34 +140,34 @@ class GalleryTests(HomeTest):
             self.queue(db, "later", self.artwork("100", title="Another Work"))
         self.desktop_down.touch()
         with self.assertLogs("artwall", level="WARNING"):
-            notice = self.post("/api/feedback", DISLIKE_CURRENT)
+            notice = self.gallery.vote("current", "dislike", "current")
         self.assertIn("could not change", notice)
-        self.assertEqual(self.state()["current"]["id"], "current")
-        self.assertEqual([item["id"] for item in self.state()["queued"]], ["alternate", "later"])
+        self.assertEqual(self.current().id, "current")
+        self.assertEqual(self.queued(), ["alternate", "later"])
         self.desktop_down.unlink()
-        self.assertIn("Now showing A Different Work", self.post("/api/feedback", DISLIKE_CURRENT))
-        self.assertIn("already changed", self.post("/api/feedback", DISLIKE_CURRENT))
-        self.assertEqual(self.state()["current"]["id"], "alternate")
-        self.assertEqual([item["id"] for item in self.state()["queued"]], ["later"])
+        self.assertIn("Now showing A Different Work", self.gallery.vote("current", "dislike", "current"))
+        self.assertIn("already changed", self.gallery.vote("current", "dislike", "current"))
+        self.assertEqual(self.current().id, "alternate")
+        self.assertEqual(self.queued(), ["later"])
         self.assertEqual([line.split()[-1] for line in self.commands()], [alternate.output_path] * 2)
         self.assertEqual(self.score(), -1)
 
-    def test_rejects_cross_origin_requests_missing_tokens_and_path_traversal(self):
-        comment = {"id": "current", "comment": "evil"}
-        self.assertEqual(self.call("/api/comment", comment, {"X-Artwall-Token": ""})[0], 403)
-        self.assertEqual(self.call("/api/comment", comment, {"Origin": "https://elsewhere.example"})[0], 403)
-        self.assertEqual(self.call("/api/curate", {}, {"X-Artwall-Token": ""})[0], 403)
-        self.assertEqual(self.call("/api/curate", {}, {"Origin": "https://elsewhere.example"})[0], 403)
-        self.assertEqual(self.call("/image/not-a-composition")[0], 404)
-        self.assertEqual(self.call("/image/..%2F..%2Fetc%2Fpasswd")[0], 404)
-        self.assertEqual(self.state()["current"]["comment"], "")
+    def test_cards_use_cached_thumbnails(self):
+        record = self.current()
+        first = self.gallery.thumbnail(record)
+        mtime = first.stat().st_mtime_ns
+        self.assertEqual(self.gallery.thumbnail(record), first)
+        self.assertEqual(first.stat().st_mtime_ns, mtime)
+        from PIL import Image
+        with Image.open(first) as preview:
+            self.assertLessEqual(preview.size[0], 800)
+            self.assertEqual(preview.format, "JPEG")
 
     def test_written_feedback_is_saved_with_context_and_sent_to_future_curation(self):
         comment = "Less empty space, and pair prints with a similar tonal range."
-        notice = self.post("/api/comment", {"id": "current", "comment": "  " + comment + "\n"})
+        notice = self.gallery.set_comment("current", "  " + comment + "\n")
         self.assertIn("newly prepared wallpapers", notice)
-        self.assertEqual(self.state()["current"]["comment"], comment)
-        self.assertEqual(self.state()["current"]["id"], "current")
+        self.assertEqual((self.current().comment, self.current().id), (comment, "current"))
         art = self.artwork("future", (1800, 1400), title="A Museum Title", artist="An Etcher",
                            museum_description="A dark hillside slopes down to the water.")
         with self.database() as db:
@@ -205,11 +187,12 @@ class GalleryTests(HomeTest):
         with self.database() as db:
             self.assertEqual(db.get_artwork(art.id).title, "A Museum Title")
         updated = "Keep the artwork large."
-        self.post("/api/comment", {"id": "current", "comment": updated})
-        self.assertEqual(self.state()["current"]["comment"], updated)
-        self.assertEqual(self.call("/api/comment", {"id": "current", "comment": "x" * 5001})[0], 400)
-        self.assertEqual(self.state()["current"]["comment"], updated)
-        self.post("/api/comment", {"id": "current", "comment": " \n "})
+        self.gallery.set_comment("current", updated)
+        self.assertEqual(self.current().comment, updated)
+        with self.assertRaises(ValueError):
+            self.gallery.set_comment("current", "x" * 5001)
+        self.assertEqual(self.current().comment, updated)
+        self.assertEqual(self.gallery.set_comment("current", " \n "), "Feedback cleared")
         with self.database() as db:
             self.assertEqual(db.curation_feedback(), [])
 
@@ -260,8 +243,7 @@ class GalleryTests(HomeTest):
         with self.database() as db:
             (composition,) = [item for item in db.list_compositions(only_unshown=True) if art.id in item.artwork_ids]
         self.assertNotIn("unavailable or invalid", composition.decision.curator_reason)
-        status, body = self.call("/api/models")
-        self.assertEqual((status, json.loads(body)["models"]), (200, ["vision-a", "vision-b"]))
+        self.assertEqual(self.gallery.models(), ["vision-a", "vision-b"])
 
     def test_reactions_are_exclusive_and_a_favorite_includes_a_like(self):
         # Each press toggles one vote; a thumbs down also drops the work from the queue.
@@ -269,7 +251,7 @@ class GalleryTests(HomeTest):
                  ("like", "like", 1), ("favorite", "like favorite", 2), ("favorite", "", 0)]
         for kind, shown, score in steps:
             with self.subTest(kind=kind, shown=shown):
-                self.post("/api/feedback", {"id": "queued", "kind": kind})
+                self.gallery.vote("queued", kind)
                 with self.database() as db:
                     feedback = db.get_feedback("queued")
                 self.assertEqual({flag for flag, on in feedback.items() if on}, set(shown.split()))

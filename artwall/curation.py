@@ -21,6 +21,7 @@ from urllib import error, request
 
 from PIL import Image, ImageDraw, ImageOps, ImageStat
 
+from artwall.agents import ask_agent
 from artwall.models import (ANCHORS, LAYOUT_COUNTS, Arrangement, Artwork, CuratorDecision, DecisionArtwork, Detail,
                             DecisionError, Row, Whole, ratio_fit)
 
@@ -513,7 +514,14 @@ def _parse_model_json(content: str) -> Any:
         content = content[7:-3].strip()
     elif content.startswith("```") and content.endswith("```"):
         content = content[3:-3].strip()
-    return json.loads(content)
+    try:
+        return json.loads(content)
+    except ValueError:
+        # Agents sometimes add a sentence around the object; take the first complete one.
+        start = content.find("{")
+        if start < 0:
+            raise
+        return json.JSONDecoder().raw_decode(content, start)[0]
 
 
 def _contact_sheet(candidates: Sequence[Artwork], *, cell_w: int = 260,
@@ -613,13 +621,16 @@ class ModelCurator:
 
     def __init__(self, model: str = "qwen3.6:27b", base_url: str = "http://127.0.0.1:11434",
                  timeout: int = 300, description_words: int = 40, *,
-                 provider: str = "ollama", api_key: str | None = None) -> None:
+                 provider: str = "ollama", api_key: str | None = None, agent: str = "claude",
+                 agent_command: Sequence[str] = ()) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.description_words = max(20, min(50, int(description_words)))
         self.provider = provider
         self.api_key = api_key
+        self.agent = agent
+        self.agent_command = tuple(agent_command)
 
     def _chat(self, prompt: str, *, image: bytes | None = None, temperature: float = 0,
               num_predict: int = 180, num_ctx: int = 8192, timeout: float | None = None) -> Any:
@@ -627,6 +638,10 @@ class ModelCurator:
         timeout = timeout or self.timeout
         if self.provider == "openai":
             return _parse_model_json(self._openai_chat(prompt, image, temperature, num_predict, timeout))
+        if self.provider == "agent":
+            # Agents start a full session per request, so they get more time than a model server.
+            return _parse_model_json(ask_agent(self.agent, prompt, image, model=self.model.strip(),
+                                               command=self.agent_command, timeout=max(timeout, 600)))
         message: dict[str, Any] = {"role": "user", "content": prompt}
         if image is not None:
             message["images"] = [base64.b64encode(image).decode("ascii")]
