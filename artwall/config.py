@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -72,11 +74,12 @@ class Settings:
     agent: str = "claude"
     agent_command: tuple[str, ...] = ()
     use_local_model: bool = True
-    curation_batch_size: int = 14
+    queue_size: int = 6  # Wallpapers kept prepared ahead of rotation.
     candidate_pool_size: int = 30
     max_artworks: int = 1
     caption_words: int = 40
     show_medium: bool = False
+    caption_on_wallpaper: bool = False
     explore_fraction: float = 0.25
     wildcard_fraction: float = 0.15
     search_terms: tuple[str, ...] = (
@@ -91,7 +94,7 @@ class Settings:
             (self.width >= 320 and self.height >= 240, "Display size must be at least 320 × 240"),
             (self.interval_minutes >= 15, "Rotation interval must be at least 15 minutes"),
             (1 <= self.max_artworks <= 3, "max_artworks must be from 1 to 3"),
-            (1 <= self.curation_batch_size <= 30, "batch_size must be from 1 to 30"),
+            (1 <= self.queue_size <= 30, "queue_size must be from 1 to 30"),
             (1 <= self.candidate_pool_size <= 100, "candidate_pool_size must be from 1 to 100"),
             (self.public_domain_only, "This release only accepts public-domain museum images"),
             (20 <= self.caption_words <= 50, "description_words must be from 20 to 50"),
@@ -119,7 +122,7 @@ _OPTIONS: dict[str, tuple[str, str, type]] = {
     "public_lock_screen_safe": ("lockscreen", "public_lock_screen_safe", bool),
     "source_artic": ("sources", "artic", bool),
     "public_domain_only": ("sources", "public_domain_only", bool),
-    "curation_batch_size": ("curation", "batch_size", int),
+    "queue_size": ("curation", "queue_size", int),
     "candidate_pool_size": ("curation", "candidate_pool_size", int),
     "max_artworks": ("curation", "max_artworks", int),
     "explore_fraction": ("curation", "explore_fraction", float),
@@ -127,6 +130,7 @@ _OPTIONS: dict[str, tuple[str, str, type]] = {
     "search_terms": ("curation", "search_terms", tuple),
     "caption_words": ("caption", "description_words", int),
     "show_medium": ("caption", "show_medium", bool),
+    "caption_on_wallpaper": ("caption", "on_wallpaper", bool),
     "use_local_model": ("llm", "enabled", bool),
     "model": ("llm", "model", str),
     "model_provider": ("llm", "provider", str),
@@ -176,6 +180,14 @@ def load_config(path: Path | None = None) -> Settings:
         return Settings()
     with path.open("rb") as handle:
         return _settings(tomllib.load(handle))
+
+
+def curation_fingerprint(settings: Settings) -> str:
+    """The settings that shape a prepared wallpaper. When they change, upcoming ones are replaced."""
+    shaping = (settings.width, settings.height, settings.max_artworks, settings.use_local_model,
+               settings.model_provider, settings.model.strip(), settings.model_url, settings.agent,
+               list(settings.agent_command), settings.caption_on_wallpaper, settings.show_medium)
+    return hashlib.sha256(json.dumps(shaping).encode()).hexdigest()[:16]
 
 
 # Settings the gallery edits. They are saved in the database and take

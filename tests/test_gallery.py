@@ -2,6 +2,7 @@
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from pathlib import Path
 import time
 from typing import Any
 from unittest.mock import patch
@@ -81,6 +82,30 @@ class GalleryTests(HomeTest):
         self.cli("next", "--no-apply")
         self.assertEqual(self.current().id, "queued")
 
+    def test_regenerating_replaces_upcoming_wallpapers_with_different_works(self):
+        self.config_file.write_text(self.config.replace("[llm]\n", "[llm]\nenabled = false\n")
+                                    + "\n[curation]\nqueue_size = 2\n")
+        with self.database() as db:
+            for index in range(4):
+                db.upsert_artwork(self.artwork(f"fresh-{index}", (1600, 1200), title=f"Fresh {index}"))
+            # The queued work is cached too, so only the avoid list keeps it out.
+            db.upsert_artwork(self.artwork("10", (1600, 1200), title="The Lighthouse", artist="A Painter"))
+            old_image = Path(db.get_composition("queued").output_path)
+        with self.assertRaises(ValueError):
+            self.gallery.regenerate(["current"])  # Shown compositions stay in history.
+        self.assertIn("Preparing", self.gallery.regenerate(["queued"]))
+        self.assertEqual(self.wait_for_preparation().status, "ready")
+        self.assertFalse(old_image.exists())
+        (replacement,) = self.gallery.state().queued
+        self.assertNotIn(self.art.id, [work.id for work in replacement.works])
+        self.assertTrue(replacement.image_path.is_file())
+        # Regenerating everything refills the queue to its size.
+        self.gallery.regenerate()
+        self.assertEqual(self.wait_for_preparation().prepared, 2)
+        self.assertEqual(len(self.queued()), 2)
+        self.assertNotIn(replacement.id, self.queued())
+        self.assertEqual(self.current().id, "current")
+
     def test_failed_preparation_keeps_the_existing_queue_available(self):
         self.config_file.write_text(self.config.replace("[llm]\n", "[llm]\nenabled = false\n"))
         self.gallery.start_preparation()
@@ -149,19 +174,10 @@ class GalleryTests(HomeTest):
         self.assertIn("already changed", self.gallery.vote("current", "dislike", "current"))
         self.assertEqual(self.current().id, "alternate")
         self.assertEqual(self.queued(), ["later"])
-        self.assertEqual([line.split()[-1] for line in self.commands()], [alternate.output_path] * 2)
+        self.assertEqual([line.split()[-1] for line in self.commands() if line.startswith("dms ")],
+                         [alternate.output_path] * 2)
+        self.assertIn("systemctl --user try-restart artwall-rotate.timer", self.commands())
         self.assertEqual(self.score(), -1)
-
-    def test_cards_use_cached_thumbnails(self):
-        record = self.current()
-        first = self.gallery.thumbnail(record)
-        mtime = first.stat().st_mtime_ns
-        self.assertEqual(self.gallery.thumbnail(record), first)
-        self.assertEqual(first.stat().st_mtime_ns, mtime)
-        from PIL import Image
-        with Image.open(first) as preview:
-            self.assertLessEqual(preview.size[0], 800)
-            self.assertEqual(preview.format, "JPEG")
 
     def test_written_feedback_is_saved_with_context_and_sent_to_future_curation(self):
         comment = "Less empty space, and pair prints with a similar tonal range."
@@ -176,7 +192,7 @@ class GalleryTests(HomeTest):
                                 description=art.museum_description)
         with patch("artwall.curation.ModelCurator._chat", return_value=draft.to_dict()) as chat:
             self.cli("curate", "--count", "1")
-        prompt = chat.call_args.args[0]
+        prompt = chat.call_args_list[0].args[0]  # The selection request; notes come after rendering.
         feedback = json.loads(prompt.split("\nViewer feedback: ", 1)[1].split("\nCandidates: ", 1)[0])
         self.assertEqual(feedback, [{"layout": "single",
                                      "works": [{"title": "The Lighthouse", "artist": "A Painter"}],

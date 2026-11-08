@@ -45,6 +45,8 @@ def details(window: ArtwallWindow, record: Record, state: State) -> Any:
         box.append(label(record.description, "body", "art-description", selectable=True))
     if record.relationship:
         box.append(label(record.relationship, "dim-label", selectable=True))
+    if record.notes:
+        box.append(_notes(record))
     box.append(_works(window, record, state))
     box.append(_feedback(window, record))
     return box
@@ -52,6 +54,12 @@ def details(window: ArtwallWindow, record: Record, state: State) -> Any:
 
 def _reactions(window: ArtwallWindow, record: Record) -> Any:
     row = Gtk.Box(spacing=8)
+    if record.shown_at is None:  # Upcoming: it can still be replaced before it is shown.
+        again = Gtk.Button(tooltip_text="Replace this upcoming wallpaper with a new one using different works")
+        again.set_child(Adw.ButtonContent(icon_name="view-refresh-symbolic", label="Regenerate"))
+        again.connect("clicked", lambda _button: window.regenerate(record))
+        row.append(again)
+        row.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
     for kind, text, icon, tooltip in _REACTIONS:
         button = Gtk.ToggleButton(active=record.reaction.includes(kind), tooltip_text=tooltip,
                                   css_classes=[f"reaction-{kind}"])
@@ -59,6 +67,19 @@ def _reactions(window: ArtwallWindow, record: Record) -> Any:
         button.connect("clicked", lambda _button, chosen=kind: window.vote(record, chosen))
         row.append(button)
     return row
+
+
+def _notes(record: Record) -> Any:
+    group = Adw.PreferencesGroup(title="What to Look For",
+                                 description="The curator's notes. Explain (Ctrl+E) shows them on the wallpaper.")
+    for number, note in enumerate(record.notes, start=1):
+        row = Adw.ExpanderRow(title=f"{number}. {note.title}", subtitle=note.body, use_markup=False,
+                              subtitle_lines=3)
+        if note.source:
+            row.add_row(Adw.ActionRow(title="From the museum description", subtitle=f"“{note.source}”",
+                                      use_markup=False, subtitle_selectable=True))
+        group.add(row)
+    return group
 
 
 def _works(window: ArtwallWindow, record: Record, state: State) -> Any:

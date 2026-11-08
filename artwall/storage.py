@@ -219,6 +219,22 @@ class Database:
             query = "SELECT * FROM compositions ORDER BY created_at DESC, id LIMIT ?"
         return self._compositions(self.connection.execute(query, (limit,)))
 
+    def discard_upcoming(self, composition_ids: Iterable[str]) -> list[Composition]:
+        """Remove prepared compositions that were never shown, with their image files."""
+        removed = []
+        with self.connection:
+            for composition_id in composition_ids:
+                composition = self.get_composition(composition_id)
+                if composition is None or composition.shown_at is not None:
+                    continue
+                self.connection.execute("DELETE FROM compositions WHERE id = ? AND shown_at IS NULL", (composition_id,))
+                removed.append(composition)
+        for composition in removed:
+            output = Path(composition.output_path)
+            for path in (output, output.with_suffix(".json")):
+                path.unlink(missing_ok=True)
+        return removed
+
     def get_state(self, key: str) -> str | None:
         row = self.connection.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
         return str(row["value"]) if row else None

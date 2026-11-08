@@ -1,6 +1,6 @@
 # Artwall
 
-A local museum curator for Linux desktops. It discovers public-domain works from the Art Institute of Chicago, asks a **vision model** (local by default, through Ollama or any OpenAI-compatible API) to select and compose them, renders wallpapers at your display's resolution with small editorial captions, and keeps a ready-to-show offline queue. One artwork per wallpaper is the default.
+A local museum curator for Linux desktops. It discovers public-domain works from the Art Institute of Chicago, asks a **vision model** (local by default, through Ollama or any OpenAI-compatible API) to select and compose them, renders wallpapers at your display's resolution with no text on the art, and keeps a ready-to-show offline queue. The curator also writes notes pinned to details of each wallpaper, which `artwall explain` shows full screen. One artwork per wallpaper is the default.
 
 Artwork is never generated or recolored. The museum supplies titles, artists, dates, rights, and source pages. The model chooses the work, layout, and short source-grounded caption. Rendering is deterministic. A narrow work remains intact against a softly blurred, subdued backdrop drawn from its colors. A fine border and soft shadow distinguish the sharp original from its surround, with the caption in the exposed space when it fits.
 
@@ -33,6 +33,7 @@ The Art Institute asks clients to download one image at a time with about a seco
 ```text
 artwall next                    Next cached composition
 artwall gui                     Open the Artwall app
+artwall explain                 The current wallpaper full screen, with the curator's notes
 artwall install-launcher        Add the app to your app launcher
 artwall previous                Return to an earlier composition
 artwall like | dislike          Teach taste; dislike also shows the next work
@@ -48,7 +49,7 @@ artwall status                  Queue and current image
 artwall debug-current           Raw museum metadata and curator decision
 artwall render --output FILE    Re-render the current decision
 artwall refresh                 Update museum metadata
-artwall curate --count 14       Prepare future wallpapers
+artwall curate                  Top the queue up to [curation].queue_size (6)
 artwall curate --count 3 --next Prepare wallpapers to show ahead of the old queue
 ```
 
@@ -56,21 +57,29 @@ The commands are intentionally small so they can be bound to keyboard shortcuts 
 
 ## The Artwall app
 
-Open **Artwall** from your app launcher, or run `artwall gui`. It is a native GTK 4 and libadwaita app with three pages: **On Your Wall** (the current composition, its description, works, and museum links), **Coming Next** (the prepared queue, and **Prepare New Wallpapers**), and **Recently Seen**. Select any card for its details. You can like, dislike, favorite, or comment on a composition; exclude artists and works; and, under Preferences (Ctrl+,), set the rotation interval, curator model, and how many works share a wallpaper. Alt+1–3 switch pages; F5 refreshes. Opening it again brings the existing window forward.
+Open **Artwall** from your app launcher, or run `artwall gui`. It is a native GTK 4 and libadwaita app with three pages: **On Your Wall** (the current composition with a countdown to the next automatic change, **Explain**, **Next Wallpaper**, its description, the curator's notes, works, and museum links), **Coming Next** (the prepared queue and **Regenerate All**), and **Recently Seen**. Select any card for its details. You can like, dislike, favorite, or comment on a composition; exclude artists and works; and, under Preferences (Ctrl+,), set the rotation interval, curator model, and how many works share a wallpaper. Alt+1–3 switch pages; Ctrl+E explains; F5 refreshes. Opening it again brings the existing window forward.
 
-**Prepare new wallpapers**, beside **Coming next**, prepares up to three wallpapers in the background using saved settings and feedback. Progress and failures appear beside the button. New results go to the front of the queue; the current wallpaper, older queued work, history, and favorites are preserved. Use it after saving layout settings or feedback to see their effect without waiting through an older batch. The command-line equivalent is `artwall curate --count 3 --next`; ordinary scheduled curation continues to append to the queue.
+Six wallpapers stay prepared (`[curation].queue_size`). **Regenerate** in an upcoming wallpaper's details replaces just that one; **Regenerate All** on **Coming Next** replaces the whole queue after confirming. Replacements avoid the works they replace, run in the background with your saved settings and feedback, and show progress beside the button. **Next Wallpaper** shows the next prepared one now and restarts the rotation timer, so it gets a full interval; the countdown reads that timer.
+
+When a setting that shapes wallpapers changes (display size, artwork limit, curator provider, model, endpoint or agent, or captions), upcoming wallpapers are prepared again with it: at once when you save in the app, and at the next hourly curation for a `config.toml` edit. Old ones stay in the queue until their replacements exist, so rotation never runs dry.
+
+## Explain
+
+`artwall explain` (or **Explain**, Ctrl+E, in the app) shows the current wallpaper full screen with the curator's notes on it. Each note has a numbered marker on the detail it is about. Point at a marker, or press its number, to outline that detail and read the note; a click or the number keeps it open. A card in the corner gives the title, artist, date, and overview. Esc closes it. The window draws the wallpaper itself, so it works on every desktop and over open windows; bind `artwall explain` to a key in your desktop or compositor to open it from anywhere.
+
+After rendering, the curator looks at the finished wallpaper and writes two to five notes, each with a box around one visible detail. A note may state history or meaning only by quoting the museum description sentence it rests on; that quote must appear verbatim in the work's museum record, and any names and years must come from the record too. Notes without a quote must describe only what is visible. Notes that fail these checks are dropped, and wallpapers prepared without a model have none.
 
 **Feedback for the Curator** appears below the current wallpaper and in each composition's details. Describe spacing, pairings, captions, or what you like about the work. Notes are saved locally, can be edited or cleared, and the eight most recently edited notes are supplied to the local model with their artwork and layout context during future curation (up to 800 characters per note and about 4,000 characters in total, newest first). Feedback guides preferences; it cannot override museum facts or validation. It does not re-render existing wallpapers, and offline curation does not interpret written feedback.
 
 Thumbs down on the current work immediately shows the next eligible cached composition. Thumbs down on an upcoming work removes it from rotation. The disliked work stays out of future curation until that feedback is reversed. If no alternative is cached, the dislike is saved and the app says why the wallpaper stayed put. A favorite includes a like; removing the favorite removes that like as well. Artist blacklists match names regardless of capitalization.
 
-Lowering the artwork limit filters previously queued compositions that exceed it immediately. Raising the limit allows more works in newly prepared layouts; it does not rearrange already rendered wallpapers. Save the setting, then choose **Prepare new wallpapers** to put fresh layouts next in rotation. Previously viewed compositions remain in history.
+Lowering the artwork limit filters previously queued compositions that exceed it immediately. Raising the limit allows more works in newly prepared layouts; it does not rearrange already rendered wallpapers. Saving it prepares upcoming wallpapers again with the new limit. Previously viewed compositions remain in history.
 
 The interval, model, and artwork limit you save in the app are stored in the database and take precedence over the same keys in `config.toml`, which artwall never rewrites. `artwall status` lists any saved values.
 
 With **Up to two** or **Up to three**, a work that already fits the display stays alone. A narrow selection is compared with related pairs and, when allowed, trios at the actual display proportions. The coverage check prefers balanced groups with compatible colors and tonal contrast. Whole works share aligned edges, a common height, and a small consistent gap. If a suitable grouping is unavailable, the intact original keeps its diffuse surround; an enlarged detail is only used when explicitly chosen by the curator. Existing cached PNGs retain their prepared layouts; `artwall curate` prepares wallpapers with the current layout rules, while `artwall render --output FILE` previews the current decision with the updated renderer.
 
-Wallpaper captions wrap titles, metadata, companion labels, and the prepared description without cutting them off at a fixed number of lines. Line spacing follows the measured font size. If a complete caption is too tall, the renderer tries a wider column and then smaller type, keeping the text and its shadow inside the display margins. Full museum titles and catalog details remain available in the gallery and `artwall info`.
+Wallpapers carry no text by default; the app and `artwall explain` hold the words. With `[caption].on_wallpaper = true`, captions wrap titles, metadata, companion labels, and the prepared description without cutting them off at a fixed number of lines. Line spacing follows the measured font size. If a complete caption is too tall, the renderer tries a wider column and then smaller type, keeping the text and its shadow inside the display margins. Full museum titles and catalog details remain available in the gallery and `artwall info`.
 
 ## Scheduling
 
@@ -80,7 +89,7 @@ After the first wallpaper works in your desktop session:
 artwall install-timers
 ```
 
-This writes five `systemd --user` units under `~/.config/systemd/user/` and enables a login service plus the rotation and daily curation timers. The login service advances one cached wallpaper when the time since the last successful wallpaper change exceeds the configured interval. Rotation then shows another every two hours by default. Daily curation refreshes ArtIC metadata and renders the next queue. The app updates an installed rotation timer when you change the interval there. If you edit `[rotation].interval_minutes` in `config.toml` instead, run `artwall install-timers` again (a value saved in the app still wins). `artwall install-timers --no-enable` writes the units without enabling them.
+This writes five `systemd --user` units under `~/.config/systemd/user/` and enables a login service plus the rotation and hourly curation timers. The login service advances one cached wallpaper when the time since the last successful wallpaper change exceeds the configured interval. Rotation then shows another every two hours by default. Hourly curation tops the queue up to six (a full, current queue needs no network or model), and refreshes ArtIC metadata at most about once a day; a failed refresh does not stop curation from the cached catalog. The app updates an installed rotation timer when you change the interval there. If you edit `[rotation].interval_minutes` in `config.toml` instead, run `artwall install-timers` again (a value saved in the app still wins). `artwall install-timers --no-enable` writes the units without enabling them.
 
 The rotation timer starts with the graphical session and does not catch up missed intervals while the computer is off. At login, Artwall keeps the current wallpaper if it changed within the interval; after a longer gap it advances once. Each later timer run also advances once. A failed desktop update leaves that work queued for the next attempt. The login service retries briefly if the wallpaper backend is still starting. Run `artwall next --if-due` to apply the same check manually.
 
@@ -94,7 +103,7 @@ The timers rely on your session starting `graphical-session.target` and exportin
 - `[lockscreen].backend`: `auto`, `dms`, `hyprlock`, `swaylock`, `kde`, or `none`.
 - `[lockscreen].public_lock_screen_safe`: conservative metadata keyword filtering when `true`. This is a best-effort filter, not image classification.
 - `[llm].provider`, `model`, and `base_url`: `ollama` (default) or `openai` for any OpenAI-compatible `/chat/completions` API: llama.cpp, vLLM, LM Studio, OpenRouter, or OpenAI itself. For `openai`, `base_url` includes `/v1`. A key, when the server needs one, comes from the environment variable named by `api_key_env` (default `OPENAI_API_KEY`) or from `api_key_file`; it is never written to config.toml. The timers do not see your shell's environment, so prefer `api_key_file` (mode 600) for scheduled curation. A hosted API receives the contact sheet of public-domain thumbnails, museum metadata, and your written feedback; rotation still never calls it. The model must accept images.
-- `provider = "agent"` curates through a signed-in agent CLI, using its subscription instead of an API key: `agent = "claude"` (Claude Code) or `"codex"` (Codex CLI). Leave `model = ""` for the agent's default, or name one of its models. Each request runs the agent once in an empty temporary directory with nothing it can change: Claude Code with no tools, MCP servers, or user settings, and no saved session; Codex in its read-only sandbox, ephemeral. `agent = "command"` runs any other CLI from `agent_command`, a list of arguments where `{image}` is replaced by the contact sheet's path; the prompt arrives on stdin and the answer is read from stdout. The daily curation timer runs the same way, and artwall looks for agents and their runtimes (such as `node`) in common install locations, because timers start with a minimal `PATH`. Agents add a large built-in prompt to every request (about 13,000 tokens for Codex in testing), and each prepared wallpaper takes two or three requests, so consider a smaller `[curation].batch_size` if you are close to your plan's limits.
+- `provider = "agent"` curates through a signed-in agent CLI, using its subscription instead of an API key: `agent = "claude"` (Claude Code) or `"codex"` (Codex CLI). Leave `model = ""` for the agent's default, or name one of its models. Each request runs the agent once in an empty temporary directory with nothing it can change: Claude Code with no tools, MCP servers, or user settings, and no saved session; Codex in its read-only sandbox, ephemeral. `agent = "command"` runs any other CLI from `agent_command`, a list of arguments where `{image}` is replaced by the contact sheet's path; the prompt arrives on stdin and the answer is read from stdout. The hourly curation timer runs the same way, and artwall looks for agents and their runtimes (such as `node`) in common install locations, because timers start with a minimal `PATH`. Agents add a large built-in prompt to every request (about 13,000 tokens for Codex in testing), and each prepared wallpaper takes two to four requests (selection, description, notes), so consider a smaller `[curation].queue_size` if you are close to your plan's limits.
 - `[curation].max_artworks`: `1` by default; raise to `2` or `3` to allow paired works again.
 - `[curation].explore_fraction` and `wildcard_fraction`: retain discovery alongside learned favorites.
 
@@ -125,7 +134,7 @@ Another tool is a small class in `artwall/desktop/wallpaper.py` or `lockscreen.p
 ```mermaid
 flowchart LR
     subgraph entry["Entry points"]
-        timers["systemd user timers<br/>login · rotate · daily curate"]
+        timers["systemd user timers<br/>login · rotate · hourly top-up"]
         cli["artwall CLI<br/>cli.py"]
         app["Artwall app<br/>app/ (GTK 4 + libadwaita)"]
     end
@@ -156,7 +165,7 @@ flowchart LR
 
     timers --> cli
     app --> gallery
-    gallery -->|"Prepare New Wallpapers<br/>runs artwall curate"| cli
+    gallery -->|"Regenerate<br/>runs artwall curate"| cli
     gallery --> rotation
     cli --> sources
     cli --> curation
@@ -179,8 +188,9 @@ Preparing wallpapers (left) may use the network and a model; showing them (right
 1. **Retrieve:** ArtIC's API supplies public-domain artworks with source URLs and rights metadata. SQLite caches API responses and normalized records.
 2. **Filter and rank:** Recent works and blacklisted items are excluded; taste seeds, explicit artist feedback, novelty, resolution, and a configurable mix of exploration select a candidate pool.
 3. **Curate:** The model receives a labeled contact sheet of cached thumbnails, museum metadata, a short composition rubric, and recent written feedback. With Ollama the request uses a 16,384-token context window so the rules, image, and up to 24 candidates are never silently truncated. It returns a constrained JSON decision. With the default limit it selects one work. Local geometry checks compare intact single, paired, and grouped works for useful display coverage. If the selection changes, a second local vision pass describes the final works. Local validation checks IDs, crop bounds, layout counts, and unsupported historical claims. A metadata-based fallback works without the model.
-4. **Render:** Pillow renders a wide work full bleed with only a very mild crop. Other proportions remain whole against a low-contrast, heavily blurred backdrop derived from the artwork. Only the backdrop is blurred and subdued; a thin edge and soft shadow separate the original from its surround. Pairs and trios keep their original proportions and paper margins at a shared height. Captions go in a side or lower surround if they fit; otherwise placement evaluates four image corners and adds a localized gradient when needed. Same-work detail templates remain available when the artwork limit is raised and the curator chooses a meaningful detail.
-5. **Queue and show:** PNGs and decisions are stored before display. `next` sets a cached image through the wallpaper adapter, updates the lock screen, and records history and feedback in SQLite.
+4. **Render:** Pillow renders a wide work full bleed with only a very mild crop. Other proportions remain whole against a low-contrast, heavily blurred backdrop derived from the artwork. Only the backdrop is blurred and subdued; a thin edge and soft shadow separate the original from its surround. Pairs and trios keep their original proportions and paper margins at a shared height. Same-work detail templates remain available when the artwork limit is raised and the curator chooses a meaningful detail.
+5. **Teach:** The model sees the finished wallpaper and writes notes pinned to its details, checked against the museum record (see [Explain](#explain)).
+6. **Queue and show:** PNGs, decisions, and notes are stored before display. `next` sets a cached image through the wallpaper adapter, updates the lock screen, and records history and feedback in SQLite.
 
 Source interfaces, desktop backends, and the renderer are separate modules so additional museums or display tools can be added without changing the queue and CLI.
 

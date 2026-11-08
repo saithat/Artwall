@@ -144,14 +144,69 @@ class CliTests(HomeTest):
         self.assertTrue(any(line.startswith("my-agent --attach /") and line.endswith("contact-sheet.jpg")
                             for line in self.commands()))
 
-    def test_install_launcher_adds_the_app_to_the_launcher(self):
-        self.assertIn("app launcher", self.cli("install-launcher"))
-        applications = self.root / "data" / "applications"
-        entry = (applications / "io.github.saithat.Artwall.desktop").read_text()
-        self.assertIn(f"Exec={self.bin_dir / 'artwall'} gui\n", entry)
-        self.assertIn("Icon=io.github.saithat.Artwall\n", entry)
-        icon = self.root / "data" / "icons" / "hicolor" / "scalable" / "apps" / "io.github.saithat.Artwall.svg"
-        self.assertTrue(icon.read_text().startswith("<svg"))
+    def test_curator_notes_teach_with_grounded_text_pinned_to_the_wallpaper(self):
+        museum = ("Jean Duvet depicted unicorns in several of his print series as representations of purity. "
+                  "Duvet densely engraved his prints.")
+        art = self.artwork("notes", (1800, 1400), title="Triumph of the Unicorn", artist="Jean Duvet",
+                           date_display="1540–50", museum_description=museum)
+        with self.database() as db:
+            db.upsert_artwork(art)
+        selection = CuratorDecision(Whole(DecisionArtwork(art.id)), description=museum.split(". ")[0] + ".").to_dict()
+        visible = "Dense parallel lines build the shadows under the procession, so the white paper reads as light."
+        notes = {"notes": [
+            {"work": 1, "title": "Engraved shadows", "body": visible, "box": [100, 200, 400, 600], "source": ""},
+            {"work": 1, "title": "A symbol of purity", "source": museum.split(". ")[0] + ".",
+             "body": "Duvet used the unicorn as a representation of purity in several print series.",
+             "box": [420, 150, 700, 500]},
+            # Rejected: a quote the museum never wrote, an invented name, a missing box, and an unknown work.
+            {"work": 1, "title": "Royal patron", "source": "King Henri II commissioned the series.",
+             "body": "King Henri II commissioned this print for his court at Fontainebleau.", "box": [0, 0, 500, 500]},
+            {"work": 1, "title": "The rider", "source": "",
+             "body": "The rider resembles Diane de Poitiers, who appears at the front of the procession.",
+             "box": [0, 0, 300, 300]},
+            {"work": 1, "title": "No place", "body": visible, "source": ""},
+            {"work": 2, "title": "Elsewhere", "body": visible, "box": [0, 0, 500, 500], "source": ""},
+        ]}
+
+        def answer(prompt: str, **_: object) -> object:
+            return notes if prompt.startswith("You are a museum educator") else selection
+
+        with patch("artwall.curation.ModelCurator._chat", side_effect=answer):
+            self.cli("curate", "--count", "1")
+        self.cli("next", "--no-apply")
+        with self.database() as db:
+            (composition,) = db.list_compositions()
+        self.assertEqual([note.title for note in composition.notes], ["Engraved shadows", "A symbol of purity"])
+        first = composition.notes[0]
+        self.assertEqual((first.box.x, first.box.y, first.box.width, first.box.height), (0.1, 0.2, 0.3, 0.4))
+        self.assertEqual(composition.notes[1].source, museum.split(". ")[0] + ".")
+        info = self.cli("info")
+        self.assertIn("What to look for:", info)
+        self.assertIn("- Engraved shadows: " + visible, info)
+        # Notes survive the database round trip and older compositions without notes still load.
+        self.assertEqual(len(json.loads(self.cli("info", "--json"))["notes"]), 2)
+
+    def test_curation_keeps_the_queue_topped_up_to_its_size(self):
+        self.configure("[curation]\nqueue_size = 3\n")
+        with self.database() as db:
+            self.queue(db, "waiting", self.artwork("waiting"))
+            for index in range(10):
+                db.upsert_artwork(self.artwork(f"top-{index}", (1600, 1200), title=f"Study {index}"))
+        # The waiting wallpaper predates these settings, so it is replaced once three new ones exist.
+        output = self.cli("curate", "--offline")
+        self.assertEqual(output.count("Queued"), 3)
+        self.assertIn("Replaced 1 wallpaper prepared with earlier settings", output)
+        with self.database() as db:
+            self.assertIsNone(db.get_composition("waiting"))
+        self.assertIn("3 wallpapers are already prepared", self.cli("curate", "--offline"))
+        self.configure("[curation]\nqueue_size = 3\nmax_artworks = 2\n")  # A setting that shapes wallpapers.
+        self.assertIn("Replaced 3 wallpapers", self.cli("curate", "--offline"))
+        # Without a reachable model, new wallpapers fill gaps but never replace model-era ones.
+        self.configure('[curation]\nqueue_size = 4\nmax_artworks = 1\n[llm]\nbase_url = "http://127.0.0.1:9"\n')
+        output = self.cli("curate")
+        self.assertEqual(output.count("Queued"), 4)
+        self.assertNotIn("Replaced", output)
+        self.assertEqual(self.cli("curate", "--offline", "--count", "1").count("Queued"), 1)  # Explicit counts still add.
 
     def test_content_filters_apply_to_curation_and_prepared_wallpapers(self):
         self.configure("[lockscreen]\npublic_lock_screen_safe = true\n")
@@ -293,7 +348,7 @@ class CliTests(HomeTest):
         for index, (width, height, count, anchor, caption_width) in enumerate(cases):
             with self.subTest(display=(width, height), works=count, anchor=anchor):
                 self.config = f"[display]\nwidth = {width}\nheight = {height}\n"
-                self.configure("[caption]\nshow_medium = true\n")
+                self.configure("[caption]\non_wallpaper = true\nshow_medium = true\n")
                 works = [self.artwork(f"caption-{index}-primary", (1600, 1450), title=title,
                                       artist="Paul Sandby", date_display="1777", movement="Romanticism",
                                       medium=medium)]

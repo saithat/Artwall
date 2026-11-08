@@ -19,7 +19,7 @@ INSTALL_HINT = (
 
 
 def run(argv: Sequence[str]) -> int:
-    """Start the app, or present its window if it is already running."""
+    """Start the app, or reach the running one: ``--explain`` opens the explain overlay."""
     try:
         from artwall.app.window import ArtwallApplication
     except (ImportError, ValueError) as exc:  # gi missing, or GTK/Adw typelibs unavailable

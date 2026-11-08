@@ -278,6 +278,32 @@ _WIRE_FIELDS = {"layout", "primary_artwork_id", "artworks", "caption_anchor", "c
 
 
 @dataclass(frozen=True)
+class Note:
+    """A point of interest the curator pins to the rendered wallpaper.
+
+    ``box`` is normalized to the whole wallpaper, so the overlay can place it on
+    any screen. ``source`` is the museum sentence a factual claim rests on.
+    """
+
+    artwork_id: str
+    title: str
+    body: str
+    box: Crop
+    source: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"artwork_id": self.artwork_id, "title": self.title, "body": self.body,
+                "box": asdict(self.box), "source": self.source}
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> Note:
+        box = Crop.parse(value.get("box"))
+        if box is None:
+            raise DecisionError("A note needs a box")
+        return cls(str(value["artwork_id"]), str(value["title"]), str(value["body"]), box, str(value.get("source", "")))
+
+
+@dataclass(frozen=True)
 class Composition:
     """A rendered wallpaper in the queue or history, with the decision that produced it."""
 
@@ -288,6 +314,7 @@ class Composition:
     render: dict[str, Any] = field(default_factory=dict)
     shown_at: float | None = None
     show_count: int = 0
+    notes: tuple[Note, ...] = ()
 
     @property
     def artwork_ids(self) -> list[str]:
@@ -296,11 +323,19 @@ class Composition:
     def to_dict(self) -> dict[str, Any]:
         """The stored JSON payload; shown_at and show_count live in their own columns."""
         return {"id": self.id, "created_at": self.created_at, "artwork_ids": self.artwork_ids,
-                "decision": self.decision.to_dict(), "render": self.render, "output_path": self.output_path}
+                "decision": self.decision.to_dict(), "render": self.render, "output_path": self.output_path,
+                "notes": [note.to_dict() for note in self.notes]}
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any], *, shown_at: float | None = None,
                   show_count: int = 0) -> Composition:
+        notes = []
+        for raw in value.get("notes") or []:
+            try:
+                notes.append(Note.from_dict(raw))
+            except (DecisionError, KeyError, TypeError, AttributeError):
+                continue  # A damaged note never hides the wallpaper itself.
         return cls(id=str(value["id"]), decision=CuratorDecision.from_dict(value.get("decision")),
                    output_path=str(value["output_path"]), created_at=float(value["created_at"]),
-                   render=dict(value.get("render") or {}), shown_at=shown_at, show_count=show_count)
+                   render=dict(value.get("render") or {}), shown_at=shown_at, show_count=show_count,
+                   notes=tuple(notes))

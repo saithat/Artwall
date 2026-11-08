@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
-from typing import Callable
+import json
+from typing import Any, Callable
 
 from artwall.config import Settings, config_home
 
@@ -57,22 +58,22 @@ Unit=artwall-rotate.service
 WantedBy=graphical-session.target
 """,
         "artwall-curate.service": f"""[Unit]
-Description=Refresh museum catalog and prepare offline wallpapers
+Description=Keep museum wallpapers prepared ahead of rotation
 After=network-online.target
 
 [Service]
 Type=oneshot
 TimeoutStartSec=2h
-ExecStart={executable} refresh
+ExecStart=-{executable} refresh --if-stale
 ExecStart={executable} curate
 """,
         "artwall-curate.timer": """[Unit]
-Description=Prepare museum wallpapers daily
+Description=Top up prepared museum wallpapers hourly
 
 [Timer]
-OnCalendar=daily
+OnCalendar=hourly
 Persistent=true
-RandomizedDelaySec=45min
+RandomizedDelaySec=5min
 Unit=artwall-curate.service
 
 [Install]
@@ -116,3 +117,27 @@ def update_rotate_timer(
     except (OSError, subprocess.CalledProcessError):
         return False
     return True
+
+
+def next_rotation(runner: Callable[..., Any] = subprocess.run) -> float | None:
+    """When the installed rotation timer fires next (Unix time), or None when no timer is active."""
+    try:
+        result = runner(["systemctl", "--user", "list-timers", "artwall-rotate.timer", "--all", "--output=json"],
+                        capture_output=True, text=True, timeout=5)
+        timers = json.loads(result.stdout or "[]")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    for timer in timers if isinstance(timers, list) else []:
+        if isinstance(timer, dict) and timer.get("unit") == "artwall-rotate.timer":
+            when = timer.get("next")
+            if isinstance(when, int) and when > 0:
+                return when / 1_000_000
+    return None
+
+
+def restart_rotation(runner: Callable[..., Any] = subprocess.run) -> None:
+    """Give a wallpaper chosen by hand a full interval before the timer rotates again."""
+    try:
+        runner(["systemctl", "--user", "try-restart", "artwall-rotate.timer"], capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass

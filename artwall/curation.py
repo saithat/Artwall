@@ -22,8 +22,8 @@ from urllib import error, request
 from PIL import Image, ImageDraw, ImageOps, ImageStat
 
 from artwall.agents import ask_agent
-from artwall.models import (ANCHORS, LAYOUT_COUNTS, Arrangement, Artwork, CuratorDecision, DecisionArtwork, Detail,
-                            DecisionError, Row, Whole, ratio_fit)
+from artwall.models import (ANCHORS, LAYOUT_COUNTS, Arrangement, Artwork, Crop, CuratorDecision, DecisionArtwork,
+                            Detail, DecisionError, Note, Row, Whole, ratio_fit)
 
 
 LOG = logging.getLogger(__name__)
@@ -403,8 +403,7 @@ def _validate_description(description: str, works: Sequence[Artwork], primary: A
     _validate_shared_caption(description, works, primary)
     _validate_multi_series(description, works)
     trusted = _trusted_text(works)
-    if set(re.findall(r"\b\d{3,4}\b", description)) - set(re.findall(r"\b\d{3,4}\b", trusted)):
-        raise DescriptionGroundingError("Description contains an unsupported historical number")
+    _check_numbers(description, trusted)
     # A deterministic extract from the museum is authoritative even when a
     # companion work has no description of its own.
     extract = description.rstrip("…").strip()
@@ -415,6 +414,16 @@ def _validate_description(description: str, works: Sequence[Artwork], primary: A
     # the bypass above; otherwise apply conservative claim and name checks.
     if _HISTORICAL_CLAIM.search(description):
         raise DescriptionGroundingError("Description makes an unsupported historical or provenance claim")
+    _check_names(description, trusted)
+
+
+def _check_numbers(text: str, trusted: str) -> None:
+    if set(re.findall(r"\b\d{3,4}\b", text)) - set(re.findall(r"\b\d{3,4}\b", trusted)):
+        raise DescriptionGroundingError("Description contains an unsupported historical number")
+
+
+def _check_names(description: str, trusted: str) -> None:
+    """Every capitalized name must appear in trusted museum text, except a sentence's first word."""
     trusted_tokens = {_name_key(match.group()) for match in _NAME.finditer(trusted)}
     for match in _NAME.finditer(description):
         token = match.group()
@@ -603,6 +612,67 @@ def _feedback_json(feedback: Iterable[Mapping[str, object]]) -> str:
     return _compact_json(notes)
 
 
+_MAX_NOTES = 5
+FALLBACK_REASON = "Local model unavailable or invalid"  # Starts a decision made without the model.
+
+
+def validate_notes(raw: object, works: Sequence[Artwork]) -> tuple[Note, ...]:
+    """Keep the notes that point at a real region and stay grounded; drop the rest."""
+    if not isinstance(raw, Mapping) or not isinstance(raw.get("notes"), list):
+        raise DecisionError("Notes must be a JSON list named notes")
+    notes: list[Note] = []
+    for entry in raw["notes"][:2 * _MAX_NOTES]:
+        try:
+            notes.append(_note(entry, works))
+        except (DecisionError, KeyError, TypeError, ValueError) as exc:
+            LOG.info("note_rejected reason=%s", exc)
+        if len(notes) == _MAX_NOTES:
+            break
+    return tuple(notes)
+
+
+def _note(entry: object, works: Sequence[Artwork]) -> Note:
+    if not isinstance(entry, Mapping):
+        raise DecisionError("A note must be an object")
+    number = entry.get("work")
+    if isinstance(number, bool) or not isinstance(number, int) or not 1 <= number <= len(works):
+        raise DecisionError("A note must name a work by its number")
+    work = works[number - 1]
+    title, body, source = (_clean_text(value if isinstance(value, str) else None, limit)
+                           for value, limit in ((entry.get("title"), 80), (entry.get("body"), 600),
+                                                (entry.get("source"), 600)))
+    if not title or len(title.split()) > 8 or not 6 <= len(body.split()) <= 70:
+        raise DescriptionGroundingError("A note needs a short title and a 6-70 word body")
+    box = entry.get("box")
+    if (not isinstance(box, list) or len(box) != 4
+            or not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in box)):
+        raise DecisionError("A note box is four numbers")
+    x0, y0, x1, y1 = (min(1000.0, max(0.0, float(v))) for v in box)  # Thousandths of the image.
+    if not (x0 < x1 and y0 < y1 and 400 <= (x1 - x0) * (y1 - y0) <= 700_000):
+        raise DecisionError("A note box must enclose a visible detail")
+    if source:
+        # A quoted museum sentence may carry history and meaning; names and
+        # dates in the note must still come from this work's own record.
+        if _normalized_phrase(source) not in _normalized_phrase(_clean_text(work.museum_description, 4000)):
+            raise DescriptionGroundingError("A note's source must be quoted from the museum description")
+        trusted = _trusted_text([work])
+        _check_numbers(body, trusted)
+        _check_names(body, trusted)
+    else:
+        _validate_description(body, [work], work)
+    return Note(work.id, title, body, Crop(x0 / 1000, y0 / 1000, (x1 - x0) / 1000, (y1 - y0) / 1000), source)
+
+
+def _preview(path: Path, width: int = 1600) -> bytes:
+    """A JPEG of the finished wallpaper small enough for any model request."""
+    with Image.open(path) as original:
+        image = original.convert("RGB")
+        image.thumbnail((width, width))
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=86)
+        return output.getvalue()
+
+
 def _post_json(url: str, payload: Mapping[str, Any], *, timeout: float, api_key: str | None = None) -> Any:
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -765,6 +835,32 @@ class ModelCurator:
             LOG.warning("model_final_caption_failed reason=%s", exc)
             return fallback
 
+    def annotate(self, wallpaper: Path, decision: CuratorDecision, pool: Sequence[Artwork]) -> tuple[Note, ...]:
+        """Ask the model to teach: points of interest pinned to the finished wallpaper."""
+        by_id = {work.id: work for work in pool}
+        works = [by_id[artwork_id] for artwork_id in decision.artwork_ids if artwork_id in by_id]
+        metadata = [{"work": index + 1, **_facts(work)} for index, work in enumerate(works)]
+        prompt = (
+            f"You are a museum educator. The image is a finished desktop wallpaper showing {len(works)} "
+            "artwork(s), numbered left to right. Write 2 to 5 short notes that teach the viewer how to look at "
+            "the art. Each note points at one specific visible detail (composition, technique, light, line, "
+            "color, texture, figures, or symbols) and explains what it does or why it matters. "
+            "Each note has: work (the number), title (at most 6 words), body (1 to 3 sentences, 15 to 60 words), "
+            "box ([x0, y0, x1, y1] drawn tightly around that detail, in 0-1000 coordinates of the whole image, "
+            "x from left to right and y from top to bottom), and source. "
+            "Historical, biographical, or symbolic facts are allowed only when that work's museum_description "
+            "states them: then copy the one supporting sentence exactly into source. Otherwise source is an "
+            "empty string and the body only describes what is visible. Never invent names, dates, places, "
+            "or meanings. Return JSON: {\"notes\": [{\"work\": 1, \"title\": \"...\", \"body\": \"...\", "
+            "\"box\": [0, 0, 1000, 1000], \"source\": \"\"}]}. Museum metadata: " + _compact_json(metadata)
+        )
+        try:
+            return validate_notes(self._chat(prompt, image=_preview(wallpaper), temperature=0.2, num_predict=1200,
+                                             timeout=min(self.timeout, 180)), works)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            LOG.warning("model_notes_failed reason=%s", exc)
+            return ()
+
     def _selection_prompt(self, ranked: Sequence[Artwork], taste: Taste, max_artworks: int,
                           screen_ratio: float, feedback: Sequence[Mapping[str, object]]) -> str:
         """The first, visual curation request: choose works and a layout."""
@@ -843,7 +939,7 @@ class ModelCurator:
             LOG.debug("model_curator_fallback_trace", exc_info=True)
             fallback = deterministic_decision(candidates, taste)
             return replace(fallback, curator_reason=(
-                f"Local model unavailable or invalid ({type(exc).__name__}); {fallback.curator_reason}"))
+                f"{FALLBACK_REASON} ({type(exc).__name__}); {fallback.curator_reason}"))
 
 
 def _whole_works(works: Sequence[DecisionArtwork]) -> Arrangement:

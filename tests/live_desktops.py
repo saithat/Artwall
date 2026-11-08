@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import json
 import subprocess
 import sys
 import time
@@ -133,6 +134,22 @@ class LiveDesktopTests(HomeTest):
         self.cli("next", "--no-apply")
         self.cli("next", "--no-apply")
         self.cli("like")  # Shows a chosen reaction in the screenshots.
+        with self.database() as db:  # Curator notes, as a model would pin them to the current wallpaper.
+            current = db.get_current()
+            payload = current.to_dict()
+            payload["notes"] = [
+                {"artwork_id": current.artwork_ids[0], "title": "A low, pale sun",
+                 "body": "The pale disk sits high and small, so the dark water below carries most of the weight "
+                         "and the eye travels up from the boats to the light.",
+                 "box": {"x": 0.42, "y": 0.08, "width": 0.16, "height": 0.26}, "source": ""},
+                {"artwork_id": current.artwork_ids[0], "title": "Dark water",
+                 "body": "A broad band of blue fills the lower third, giving the quiet harbor its calm weight.",
+                 "box": {"x": 0.2, "y": 0.68, "width": 0.6, "height": 0.28},
+                 "source": "A pale sun hangs over dark water while two small boats rest near the far bank and "
+                           "clouds drift across a wide sky."}]
+            db.connection.execute("UPDATE compositions SET payload = ? WHERE id = ?",
+                                  (json.dumps(payload), current.id))
+            db.connection.commit()
         session = {"WAYLAND_DISPLAY": os.environ["ARTWALL_TEST_WAYLAND_DISPLAY"],
                    "SWAYSOCK": os.environ["ARTWALL_TEST_SWAYSOCK"], "XDG_CURRENT_DESKTOP": "sway"}
         environment = {**os.environ, **session, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
@@ -160,6 +177,25 @@ class LiveDesktopTests(HomeTest):
             self.assertIsNone(app.poll(), "The app exited while switching views")
             if shots:
                 subprocess.run(["grim", f"{shots}/{name}.png"], check=True, env=environment)
+        # The explain overlay: full screen, then pointing at the first note's marker.
+        subprocess.run(["gdbus", "call", "--session", "--dest", "io.github.saithat.Artwall", "--object-path",
+                        "/io/github/saithat/Artwall", "--method", "org.gtk.Actions.Activate", "explain", "[]", "{}"],
+                       check=True, env=environment, capture_output=True)
+        time.sleep(2)
+        self.assertIsNone(app.poll(), "The app exited while opening the explain overlay")
+        tree = subprocess.run(["swaymsg", "-t", "get_tree"], env=environment, capture_output=True, text=True).stdout
+        if "Explain: Harbor at Dusk" not in tree:
+            app.terminate()
+            self.fail("The explain overlay did not open:\n" + app.communicate(timeout=10)[0])
+        if shots:
+            subprocess.run(["grim", f"{shots}/explain.png"], check=True, env=environment)
+        # Headless Sway has no pointer, so open the first note as its number key does.
+        subprocess.run(["gdbus", "call", "--session", "--dest", "io.github.saithat.Artwall", "--object-path",
+                        "/io/github/saithat/Artwall/window/2", "--method", "org.gtk.Actions.Activate",
+                        "toggle-note", "[<1>]", "{}"], check=True, env=environment, capture_output=True)
+        time.sleep(1.5)
+        if shots:
+            subprocess.run(["grim", f"{shots}/explain-note.png"], check=True, env=environment)
         app.terminate()
         output = app.communicate(timeout=10)[0]
         self.assertNotIn("Traceback", output, output)

@@ -13,15 +13,16 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Callable
+from typing import Callable, Sequence
 from uuid import uuid4
 import webbrowser
 
 from artwall import rotation
 from artwall.config import (
-    Settings, cache_dir, config_path, data_dir, database_path, load_config, model_api_key, write_atomic,
+    Settings, cache_dir, config_path, curation_fingerprint, data_dir, database_path, load_config, model_api_key,
+    write_atomic,
 )
-from artwall.curation import ModelCurator, Taste, choose_composition, score_candidate
+from artwall.curation import FALLBACK_REASON, ModelCurator, Taste, choose_composition, score_candidate
 from artwall.desktop import detect_display_size, lock_screen_backend_name, wallpaper_backend_name
 from artwall.launcher import install_launcher
 from artwall.models import Artwork, Composition, CuratorDecision
@@ -132,17 +133,21 @@ def _render(db: Database, decision: CuratorDecision, settings: Settings, output:
     if len(artworks) != len(decision.artworks):
         raise ValueError("Composition references an artwork missing from the database")
     return render_wallpaper(decision, artworks, output, RenderSettings(
-        width=settings.width, height=settings.height, show_medium=settings.show_medium))
+        width=settings.width, height=settings.height, show_medium=settings.show_medium,
+        caption=settings.caption_on_wallpaper))
 
 
-def _queue(db: Database, decision: CuratorDecision, settings: Settings, *, queue_priority: float = 0) -> Composition:
-    """Render a decision and store it, with a JSON sidecar, before it is ever shown."""
+def _queue(db: Database, decision: CuratorDecision, settings: Settings, *, queue_priority: float = 0,
+           curator: ModelCurator | None = None, pool: Sequence[Artwork] = ()) -> Composition:
+    """Render a decision, add the curator's notes, and store it with a JSON sidecar before it is ever shown."""
     identifier = uuid4().hex
     output = data_dir() / "compositions" / f"{identifier}.png"
     rendered = _render(db, decision, settings, output)
     details = {key: value for key, value in asdict(rendered).items() if key != "path"}
+    notes = curator.annotate(rendered.path, decision, pool) if curator is not None else ()
     composition = Composition(identifier, decision, str(rendered.path),
-                              render={**details, "width": settings.width, "height": settings.height})
+                              render={**details, "width": settings.width, "height": settings.height,
+                                      "settings": curation_fingerprint(settings)}, notes=notes)
     write_atomic(output.with_suffix(".json"), json.dumps(composition.to_dict(), ensure_ascii=False, indent=2) + "\n")
     db.add_composition(composition, queue_priority=queue_priority)
     return composition
@@ -174,6 +179,10 @@ def cmd_refresh(args: argparse.Namespace, settings: Settings) -> None:
         raise ValueError("Page must be at least 1")
     added = 0
     with _database() as db:
+        last = db.get_state("last_refresh_at")
+        if args.if_stale and last and time.time() - float(last) < _REFRESH_AGE:
+            print("Museum metadata was refreshed recently.")
+            return
         source = ArticSource(db)
         terms = (args.query,) if args.query else settings.search_terms
         try:
@@ -192,27 +201,47 @@ def cmd_refresh(args: argparse.Namespace, settings: Settings) -> None:
                 LOG.warning("source_search_failed source=artic query=%r page=%d error=%s", term, page, exc)
         if not args.query and args.page is None:
             db.set_state("next_search_page", str(page + 1 if added else 1))
+        if added:
+            db.set_state("last_refresh_at", str(time.time()))
         cached = db.count_artworks()
     if not added and not cached:
         raise RuntimeError("No museum metadata available; ArtIC search failed and the cache is empty")
     print(f"Refreshed {added} ArtIC records from page {page}. Metadata remains cached locally.")
 
 
+_REFRESH_AGE = 20 * 3600  # A scheduled refresh runs at most about once a day.
+
+
 def cmd_curate(args: argparse.Namespace, settings: Settings) -> None:
-    count = args.count or settings.curation_batch_size
-    if not 1 <= count <= 30:
-        raise ValueError("Count must be between 1 and 30")
+    stale: list[Composition] = []
+    if args.count is not None:
+        count = args.count
+        if not 1 <= count <= 30:
+            raise ValueError("Count must be between 1 and 30")
+    else:
+        # Top the queue up; a full, current queue needs no museum or model request.
+        # Wallpapers prepared under other settings are replaced, newest work first,
+        # and removed only once their replacements exist, so rotation never runs dry.
+        fingerprint = curation_fingerprint(settings)
+        with _database() as db:
+            upcoming = list(rotation.upcoming(db, settings))
+        stale = [item for item in upcoming if item.render.get("settings") != fingerprint]
+        count = settings.queue_size - (len(upcoming) - len(stale))
+        if count <= 0:
+            print(f"{len(upcoming)} wallpapers are already prepared.")
+            return
     curator = (ModelCurator(settings.model, settings.model_url, description_words=settings.caption_words,
                             provider=settings.model_provider, api_key=model_api_key(settings),
                             agent=settings.agent, agent_command=settings.agent_command)
                if settings.use_local_model and not args.offline else None)
-    created = 0
+    created = curated = 0
     started = time.time()
     queue_priority = started if args.next else 0
     with _database() as db:
         source = ArticSource(db)
         reserved = {artwork_id for composition in rotation.upcoming(db, settings)
                     for artwork_id in composition.artwork_ids}
+        reserved |= {artwork_id for artwork_id in args.avoid.split(",") if artwork_id}
         for _ in range(count):
             reserved |= _queued_since(db, started)
             taste = _taste(db, reserved)
@@ -228,10 +257,17 @@ def cmd_curate(args: argparse.Namespace, settings: Settings) -> None:
             if reserved.intersection(decision.artwork_ids):
                 LOG.info("composition_skipped reason=queued_concurrently artworks=%s", decision.artwork_ids)
                 continue
-            composition = _queue(db, decision, settings, queue_priority=queue_priority)
+            composition = _queue(db, decision, settings, queue_priority=queue_priority, curator=curator, pool=pool)
             reserved.update(composition.artwork_ids)
             created += 1
+            # A model-curated wallpaper is only replaced by another the model curated.
+            if curator is None or not decision.curator_reason.startswith(FALLBACK_REASON):
+                curated += 1
             print(f"Queued {composition.id[:8]}: {_label(db, composition)}", flush=True)
+    if args.count is None and stale and curated:
+        with _database() as db:
+            replaced = db.discard_upcoming(item.id for item in stale[:curated])
+        print(f"Replaced {len(replaced)} wallpaper{'s' if len(replaced) != 1 else ''} prepared with earlier settings.")
     if not created:
         raise RuntimeError("No new composition could be made. Run 'artwall refresh' or inspect cached image failures.")
 
@@ -313,6 +349,10 @@ def cmd_info(args: argparse.Namespace, settings: Settings) -> None:
                             ("Curator: ", decision.curator_reason)):
             if text:
                 print(f"\n{label}{text}")
+        if composition.notes:
+            print("\nWhat to look for:")
+            for note in composition.notes:
+                print(f"- {note.title}: {note.body}" + (f" (Museum: \"{note.source}\")" if note.source else ""))
 
 
 def cmd_debug(args: argparse.Namespace, settings: Settings) -> None:
@@ -390,6 +430,12 @@ def cmd_gui(args: argparse.Namespace, settings: Settings) -> None:
     run([sys.argv[0]])
 
 
+def cmd_explain(args: argparse.Namespace, settings: Settings) -> None:
+    from artwall.app import run
+
+    run([sys.argv[0], "--explain"])
+
+
 def cmd_install_launcher(args: argparse.Namespace, settings: Settings) -> None:
     for path in install_launcher(_executable()):
         print(path)
@@ -419,6 +465,7 @@ _COMMANDS: dict[str, tuple[Handler, str]] = {
     "curate": (cmd_curate, "prepare future wallpapers"),
     "install-timers": (cmd_install_timers, "install and enable user timers"),
     "gui": (cmd_gui, "open the Artwall app"),
+    "explain": (cmd_explain, "show the current wallpaper full screen with the curator's notes"),
     "install-launcher": (cmd_install_launcher, "add the Artwall app to your app launcher"),
 }
 
@@ -446,10 +493,12 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--query", help="search one ArtIC topic")
             command.add_argument("--limit", type=int, default=30)
             command.add_argument("--page", type=int, help="search a specific museum results page")
+            command.add_argument("--if-stale", action="store_true", help="skip when refreshed in the last 20 hours")
         if name == "curate":
             command.add_argument("--count", type=int)
             command.add_argument("--offline", action="store_true", help="use local deterministic curator")
             command.add_argument("--next", action="store_true", help="place new wallpapers ahead of the existing queue")
+            command.add_argument("--avoid", default="", help="comma-separated artwork IDs not to use this time")
         if name in ("more-from-artist", "less-from-artist", "blacklist-artist"):
             command.add_argument("artist", nargs="?", help="defaults to the current primary artist")
         if name == "install-timers":

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from importlib import metadata
 import logging
+import time
 from typing import Any
 
 import gi
@@ -14,6 +15,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from artwall.app.details import details, when  # noqa: E402
+from artwall.app.explain import CSS as EXPLAIN_CSS, open_explain  # noqa: E402
 from artwall.app.preferences import Preferences  # noqa: E402
 from artwall.app.widgets import Background, label, picture, vbox  # noqa: E402
 from artwall.gallery import Gallery, Record, State  # noqa: E402
@@ -38,7 +40,8 @@ button.reaction-dislike:checked { background-color: @error_bg_color; color: @err
 
 class ArtwallApplication(Adw.Application):  # type: ignore[misc]
     def __init__(self) -> None:
-        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        # Command lines reach the running instance, so `artwall explain` opens there.
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
         self.gallery = Gallery()
         self.background = Background()
 
@@ -49,11 +52,12 @@ class ArtwallApplication(Adw.Application):  # type: ignore[misc]
             # The icon also resolves before `artwall install-launcher` has run.
             Gtk.IconTheme.get_for_display(display).add_search_path(str(DATA / "icons"))
             css = Gtk.CssProvider()
-            css.load_from_string(_CSS)
+            css.load_from_string(_CSS + EXPLAIN_CSS)
             Gtk.StyleContext.add_provider_for_display(display, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         Gtk.Window.set_default_icon_name(APP_ID)
         for name, callback, accels in (("quit", lambda *_: self.quit(), ["<Control>q"]),
-                                       ("about", lambda *_: self._about(), [])):
+                                       ("about", lambda *_: self._about(), []),
+                                       ("explain", lambda *_: self.explain(), ["<Control>e"])):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", callback)
             self.add_action(action)
@@ -64,8 +68,29 @@ class ArtwallApplication(Adw.Application):  # type: ignore[misc]
             self.set_accels_for_action(f"win.show-page::{page}", [f"<Alt>{index}"])
 
     def do_activate(self) -> None:
-        window = self.get_active_window() or ArtwallWindow(self)
+        window = next((w for w in self.get_windows() if isinstance(w, ArtwallWindow)), None) or ArtwallWindow(self)
         window.present()
+
+    def do_command_line(self, command_line: Any) -> int:
+        if "--explain" in command_line.get_arguments()[1:]:
+            self.explain()
+        else:
+            self.activate()
+        return 0
+
+    def explain(self) -> None:
+        """Show the current wallpaper full screen with the curator's notes."""
+        self.hold()  # Keep a command-line-only instance alive while the state loads.
+
+        def show(record: Record | None) -> None:
+            open_explain(self, record, self.background)
+            self.release()
+
+        def failed(exc: Exception) -> None:
+            LOG.warning("explain failed: %s", exc)
+            self.release()
+
+        self.background.run(lambda: self.gallery.state().current, show, failed)
 
     def do_shutdown(self) -> None:
         self.background.shutdown()
@@ -96,6 +121,11 @@ class ArtwallWindow(Adw.ApplicationWindow):  # type: ignore[misc]
         self.dialog_record: str | None = None
         self.preferences: Preferences | None = None
         self.prepared = 0  # Wallpapers the running preparation has finished, as last shown.
+        self.polling = False
+        self.next_time: float | None = None  # When the rotation timer fires next.
+        self.countdown: Any = None
+        GLib.timeout_add_seconds(1, self._tick)
+        GLib.timeout_add_seconds(60, self._refresh_next_time)
 
         header = Adw.HeaderBar()
         self.stack = Adw.ViewStack()
@@ -137,6 +167,38 @@ class ArtwallWindow(Adw.ApplicationWindow):  # type: ignore[misc]
 
     def reload(self) -> None:
         self.background.run(self.gallery.state, self._show, lambda exc: self.toast(f"Could not load the gallery: {exc}"))
+        self._refresh_next_time()
+
+    def _refresh_next_time(self) -> bool:
+        self.background.run(self.gallery.next_change, self._set_next_time, lambda exc: None)
+        return True
+
+    def _set_next_time(self, when: float | None) -> None:
+        self.next_time = when
+        self._tick()
+
+    def _tick(self) -> bool:
+        """Update the countdown to the next automatic wallpaper change."""
+        if self.countdown is None:
+            return True
+        if self.next_time is None:
+            self.countdown.set_label("Automatic rotation is off. Run artwall install-timers to rotate on a schedule.")
+            return True
+        left = int(self.next_time - time.time())
+        if left <= 0:
+            self.countdown.set_label("Changing now…")
+            if left < -5:  # The timer has fired; show the new wallpaper and its next time.
+                self.next_time = None
+                self.reload()
+            return True
+        hours, rest = divmod(left, 3600)
+        minutes, seconds = divmod(rest, 60)
+        span = f"{hours} h {minutes:02d} min" if hours else f"{minutes} min {seconds:02d} s" if minutes else f"{seconds} s"
+        self.countdown.set_label(f"Next wallpaper in {span}")
+        return True
+
+    def show_next(self) -> None:
+        self.mutate(self.gallery.show_next)
 
     def mutate(self, change: Callable[[], str]) -> None:
         """Apply one change in the background, report it, and refresh the window."""
@@ -168,13 +230,41 @@ class ArtwallWindow(Adw.ApplicationWindow):  # type: ignore[misc]
 
         self.mutate(save)
 
-    def prepare(self) -> None:
+    def regenerate(self, record: Record | None = None) -> None:
+        """Replace one upcoming wallpaper, or after confirmation the whole queue, with new curation."""
+        if record is not None:
+            self._start_regenerating([record.id])
+            return
+        confirm = Adw.AlertDialog(heading="Regenerate All Upcoming Wallpapers?",
+                                  body="The prepared queue is replaced with newly curated wallpapers using different "
+                                       "works. This uses the curator model and may take a few minutes.")
+        confirm.add_response("cancel", "Cancel")
+        confirm.add_response("regenerate", "Regenerate")
+        confirm.set_response_appearance("regenerate", Adw.ResponseAppearance.SUGGESTED)
+        confirm.connect("response", self._confirmed_regenerate)
+        confirm.present(self)
+
+    def _confirmed_regenerate(self, _dialog: Any, response: str) -> None:
+        if response == "regenerate":
+            self._start_regenerating(None)
+
+    def _start_regenerating(self, ids: list[str] | None) -> None:
         self.prepare_button.set_sensitive(False)
-        self.background.run(self.gallery.start_preparation, self._preparing, lambda exc: self.toast(str(exc)))
+        self.background.run(lambda: self.gallery.regenerate(ids), self._preparing, self._regenerate_failed)
+
+    def _regenerate_failed(self, exc: Exception) -> None:
+        self.prepare_button.set_sensitive(True)
+        self.toast(str(exc))
 
     def _preparing(self, notice: str) -> None:
         self.toast(notice)
         self.prepared = 0
+        self._watch_preparation()
+
+    def _watch_preparation(self) -> None:
+        if self.polling:
+            return
+        self.polling = True
         self._poll_preparation()
         GLib.timeout_add_seconds(2, self._poll_preparation)
 
@@ -182,12 +272,13 @@ class ArtwallWindow(Adw.ApplicationWindow):  # type: ignore[misc]
         progress = self.gallery.preparation()
         running = progress.status == "running"
         self.prepare_button.set_sensitive(not running)
-        self.prepare_button.set_label("Preparing…" if running else "Prepare New Wallpapers")
+        self.prepare_button.set_label("Preparing…" if running else "Regenerate All")
         self.prepare_status.set_label(progress.message)
         if progress.prepared != self.prepared or not running:
             self.prepared = progress.prepared
             self.reload()
         if not running:
+            self.polling = False
             self.toast(progress.message)
         return running
 
@@ -195,9 +286,12 @@ class ArtwallWindow(Adw.ApplicationWindow):  # type: ignore[misc]
 
     def _show(self, state: State) -> None:
         self.state = state
+        if self.gallery.preparation().status == "running":
+            self._watch_preparation()  # For example after settings changed upcoming wallpapers.
         self.now.set_child(self._now_page(state))
         self.coming_grid.set_child(self._grid(
-            state.queued, "Nothing Prepared Yet", "Prepare new wallpapers to fill the queue.", "view-grid-symbolic"))
+            state.queued, "Nothing Prepared Yet", "Regenerate to prepare the queue now, or wait for the hourly "
+            "curation.", "view-grid-symbolic"))
         self.coming_page.set_badge_number(len(state.queued))
         self.seen.set_child(self._grid(state.history, "Nothing Seen Yet", "Works you have lived with appear here.",
                                        "document-open-recent-symbolic"))
@@ -215,19 +309,34 @@ class ArtwallWindow(Adw.ApplicationWindow):  # type: ignore[misc]
         if record is None:
             return Adw.StatusPage(icon_name=APP_ID, title="Nothing on Your Wall Yet",
                                   description="Prepare wallpapers under Coming Next, then run artwall next.")
-        box = vbox(spacing=24, margin=24)
+        box = vbox(spacing=18, margin=24)
+        bar = Gtk.Box(spacing=8)
+        self.countdown = label("", "dim-label", "numeric")
+        self.countdown.set_hexpand(True)
+        bar.append(self.countdown)
+        explain = Gtk.Button(tooltip_text="Show this wallpaper full screen with the curator's notes (Ctrl+E)",
+                             action_name="app.explain")
+        explain.set_child(Adw.ButtonContent(icon_name="view-reveal-symbolic", label="Explain"))
+        forward = Gtk.Button(tooltip_text="Show the next prepared wallpaper now", css_classes=["suggested-action"])
+        forward.set_child(Adw.ButtonContent(icon_name="go-next-symbolic", label="Next Wallpaper"))
+        forward.connect("clicked", lambda _button: self.show_next())
+        bar.append(explain)
+        bar.append(forward)
+        box.append(bar)
         box.append(picture(self.background, lambda: record.image_path, record.title, "artwork"))
         box.append(details(self, record, state))
+        self._tick()
         return Adw.Clamp(maximum_size=1200, child=box)
 
     def _coming_shell(self) -> Any:
         box = vbox(spacing=0)
         bar = Gtk.Box(spacing=18, margin_top=18, margin_bottom=6, margin_start=24, margin_end=24)
-        self.prepare_status = label("Uses your saved settings and feedback. New wallpapers go first.", "dim-label")
+        self.prepare_status = label("Up to six wallpapers stay prepared. Regenerating replaces them with new "
+                                    "curation that avoids the replaced works.", "dim-label")
         self.prepare_status.set_hexpand(True)
-        self.prepare_button = Gtk.Button(label="Prepare New Wallpapers", css_classes=["suggested-action", "pill"],
+        self.prepare_button = Gtk.Button(label="Regenerate All", css_classes=["suggested-action", "pill"],
                                          valign=Gtk.Align.CENTER)
-        self.prepare_button.connect("clicked", lambda _button: self.prepare())
+        self.prepare_button.connect("clicked", lambda _button: self.regenerate())
         bar.append(self.prepare_status)
         bar.append(self.prepare_button)
         box.append(bar)

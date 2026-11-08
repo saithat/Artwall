@@ -16,17 +16,19 @@ import shutil
 import subprocess
 import sys
 from threading import Lock, Thread
-from typing import Literal
+from typing import Literal, Sequence
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from PIL import Image, ImageOps
 
 from artwall import rotation
-from artwall.config import Settings, config_path, data_dir, database_path, load_config, model_api_key
-from artwall.models import Artwork, Composition
+from artwall.config import (
+    Settings, config_path, curation_fingerprint, data_dir, database_path, load_config, model_api_key,
+)
+from artwall.models import Artwork, Composition, Note
 from artwall.storage import Database
-from artwall.systemd import update_rotate_timer, user_unit_dir
+from artwall.systemd import next_rotation, restart_rotation, update_rotate_timer, user_unit_dir
 
 LOG = logging.getLogger(__name__)
 BATCH = 3  # Wallpapers made by one "Prepare new wallpapers" request.
@@ -63,6 +65,7 @@ class Record:
     shown_at: float | None
     reaction: rotation.Reaction
     comment: str
+    notes: tuple[Note, ...] = ()
 
     @property
     def title(self) -> str:
@@ -101,6 +104,7 @@ class Preparation:
     status: PreparationStatus
     prepared: int
     message: str
+    total: int = 0
 
 
 @dataclass
@@ -127,7 +131,8 @@ class Gallery:
         return Record(composition.id, works, primary, composition.decision.description,
                       composition.decision.relationship, composition.decision.layout,
                       Path(composition.output_path), composition.created_at, composition.shown_at,
-                      rotation.Reaction.stored(db.get_feedback(composition.id)), db.get_comment(composition.id))
+                      rotation.Reaction.stored(db.get_feedback(composition.id)), db.get_comment(composition.id),
+                      composition.notes)
 
     def state(self) -> State:
         """A factual view of the current wallpaper, the queue, and history."""
@@ -172,10 +177,29 @@ class Gallery:
                 except Exception as exc:
                     LOG.warning("Could not advance wallpaper after thumbs down: %s", exc)
                     return "Thumbs down saved, but the wallpaper could not change. Check the desktop backend."
+                restart_rotation()
                 return f"Thumbs down saved. Now showing {self._record(db, shown).title}."
             if kind == "dislike" and enabled and not was_set and composition.shown_at is None:
                 return "Thumbs down saved. Removed from upcoming rotation."
             return "Feedback saved"
+
+    def show_next(self) -> str:
+        """Show the next prepared wallpaper now, giving it a full rotation interval."""
+        with self._vote_lock, self._database() as db:
+            try:
+                shown = rotation.advance(db, db.settings(load_config(self.config_file)))
+            except rotation.NoAlternativeError as exc:
+                raise ValueError("No other prepared wallpaper is available yet.") from exc
+            except Exception as exc:
+                LOG.warning("Could not show the next wallpaper: %s", exc)
+                raise ValueError("The wallpaper could not change. Check the desktop backend.") from exc
+            title = self._record(db, shown).title
+        restart_rotation()
+        return f"Now showing {title}."
+
+    def next_change(self) -> float | None:
+        """When the rotation timer shows the next wallpaper (Unix time), if timers are installed."""
+        return next_rotation()
 
     def save_settings(self, *, interval_minutes: int, model: str, max_artworks: int) -> str:
         """Validate and save the gallery's settings, updating an installed rotation timer."""
@@ -191,12 +215,17 @@ class Gallery:
             old = db.settings(configured)
             settings = db.save_gallery_settings(configured, {
                 "interval_minutes": interval_minutes, "max_artworks": max_artworks, "model": model})
+        notice = "Settings saved."
         if interval_minutes != old.interval_minutes:
             executable = shutil.which("artwall")
             if not executable or not update_rotate_timer(settings, str(Path(executable).resolve()),
                                                          directory=self.unit_dir):
-                return "Settings saved. Run artwall install-timers to apply the new rotation interval."
-        return "Settings saved. Prepare new wallpapers to create layouts with these settings."
+                notice += " Run artwall install-timers to apply the new rotation interval."
+        if curation_fingerprint(settings) != curation_fingerprint(old):
+            # Upcoming wallpapers follow the new settings; old ones stay until replaced.
+            self.start_preparation(None)
+            notice += " Upcoming wallpapers are being prepared again with them."
+        return notice
 
     def set_comment(self, composition_id: str, comment: str) -> str:
         if len(comment) > MAX_COMMENT:
@@ -252,31 +281,55 @@ class Gallery:
         with self._lock:
             return self._preparation
 
-    def start_preparation(self) -> str:
+    def regenerate(self, composition_ids: Sequence[str] | None = None) -> str:
+        """Replace upcoming wallpapers (all of them by default) with newly curated ones.
+
+        The replaced works are avoided this time, so regenerating brings different art.
+        """
+        with self._lock:
+            if self._preparation.status == "running":
+                return "Already preparing new wallpapers."
+        with self._database() as db:
+            settings = db.settings(load_config(self.config_file))
+            ids = list(composition_ids) if composition_ids is not None else [
+                composition.id for composition in rotation.upcoming(db, settings)]
+            removed = db.discard_upcoming(ids)
+        count = len(removed) if composition_ids is not None else settings.queue_size
+        if count == 0:
+            raise ValueError("Nothing to regenerate")
+        avoid = sorted({artwork_id for composition in removed for artwork_id in composition.artwork_ids})
+        return self.start_preparation(count, avoid=avoid)
+
+    def start_preparation(self, count: int | None = BATCH, *, avoid: Sequence[str] = ()) -> str:
+        """Curate ``count`` wallpapers ahead of the queue, or with None top the queue up to its size."""
         with self._lock:
             if self._preparation.status == "running":
                 return "Already preparing new wallpapers."
             # -P keeps the working directory off sys.path, so an unrelated
             # artwall/ folder there can never replace the installed package.
-            process = subprocess.Popen(
-                [sys.executable, "-P", "-m", "artwall.cli", "curate", "--count", str(BATCH), "--next"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            )
+            command = [sys.executable, "-P", "-m", "artwall.cli", "curate"]
+            if count is not None:
+                command += ["--count", str(count), "--next", "--avoid", ",".join(avoid)]
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            total = count if count is not None else self.settings().queue_size
             self._preparation = Preparation(
-                "running", 0, f"Preparing {BATCH} wallpapers with your saved settings. This may take a few minutes.")
-            Thread(target=self._watch_preparation, args=(process,), daemon=True).start()
-        return "Preparing new wallpapers. You can keep using the gallery."
+                "running", 0, f"Preparing up to {total} wallpaper{'s' if total != 1 else ''} with your saved "
+                              "settings. This may take a few minutes.", total)
+            Thread(target=self._watch_preparation, args=(process, total), daemon=True).start()
+        return "Preparing new wallpapers. You can keep using Artwall."
 
-    def _watch_preparation(self, process: subprocess.Popen[str]) -> None:
+    def _watch_preparation(self, process: subprocess.Popen[str], total: int) -> None:
         assert process.stdout is not None
         count = 0
         with process.stdout:
             for line in process.stdout:
+                if line.startswith(("Replaced ", "already prepared")) or "already prepared" in line:
+                    continue
                 if line.startswith("Queued "):
                     count += 1
                     with self._lock:
                         self._preparation = Preparation(
-                            "running", count, f"{count} of {BATCH} wallpapers ready. Still preparing…")
+                            "running", count, f"{count} of {total} wallpapers ready. Still preparing…", total)
                 else:
                     LOG.warning("curator: %s", line.rstrip())
         result = process.wait()

@@ -22,13 +22,14 @@ artic = true
 public_domain_only = true
 
 [curation]
-batch_size = 14
+queue_size = 6 # Wallpapers kept prepared ahead; curation tops the queue up to this.
 candidate_pool_size = 30
 max_artworks = 1 # Choose 1, 2, or 3; the default shows a single work.
 explore_fraction = 0.25
 wildcard_fraction = 0.15
 
 [caption]
+on_wallpaper = false # Text lives in the app and `artwall explain`; true draws a caption on the image.
 description_words = 40
 show_medium = false
 

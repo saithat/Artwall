@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from hypothesis import HealthCheck, event, given, settings, strategies as st
 
-from artwall.curation import ModelCurator, Taste, choose_composition
+from artwall.curation import ModelCurator, Taste, choose_composition, validate_notes
 from artwall.models import ANCHORS, LAYOUT_COUNTS
 from tests.support import HomeTest
 
@@ -71,3 +71,26 @@ class ModelOutputTests(HomeTest):
             if work.crop:
                 self.assertTrue(0 <= work.crop.x and work.crop.x + work.crop.width <= 1.000001)
                 self.assertTrue(0 <= work.crop.y and work.crop.y + work.crop.height <= 1.000001)
+
+    @settings(max_examples=200, deadline=None)
+    @given(raw=st.fixed_dictionaries({"notes": st.lists(
+        st.fixed_dictionaries({}, optional={
+            "work": st.integers(-1, 4) | _json, "title": st.text(max_size=60) | _json,
+            "body": st.text(max_size=400) | st.just(_MUSEUM_TEXT) | _json,
+            "box": st.lists(st.floats(-200, 1200, allow_nan=False) | st.integers(-5, 1005), max_size=5) | _json,
+            "source": st.sampled_from(["", _MUSEUM_TEXT]) | st.text(max_size=80) | _json,
+        }) | _json, max_size=8)}) | _json)
+    def test_any_notes_answer_yields_only_valid_notes(self, raw: Any):
+        if not hasattr(self, "pool"):
+            self.pool = [self.artwork(f"fuzz-{index}", (1600, 1200), museum_description=_MUSEUM_TEXT)
+                         for index in range(2)]
+        try:
+            notes = validate_notes(raw, self.pool)
+        except (ValueError, TypeError):
+            return  # The whole answer was malformed; the composition is kept without notes.
+        self.assertLessEqual(len(notes), 5)
+        for note in notes:
+            self.assertIn(note.artwork_id, {work.id for work in self.pool})
+            self.assertTrue(0 <= note.box.x and note.box.x + note.box.width <= 1.000001)
+            self.assertTrue(0 <= note.box.y and note.box.y + note.box.height <= 1.000001)
+            self.assertTrue(note.title and 6 <= len(note.body.split()) <= 70)

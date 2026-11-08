@@ -39,6 +39,7 @@ class RenderSettings:
     font_title: str | None = None
     font_body: str | None = None
     show_medium: bool = False
+    caption: bool = True  # Off by default in config: the explain overlay carries the text instead.
     # Common centered password area. Corner captions never intentionally enter it.
     lock_ui_region: tuple[float, float, float, float] = (0.34, 0.30, 0.66, 0.76)
 
@@ -603,6 +604,10 @@ def render_wallpaper(decision: CuratorDecision, artworks: Mapping[str, Artwork],
     # Only identify other works actually shown. A detail panel is the same artwork.
     companions = [artworks[artwork_id] for artwork_id in dict.fromkeys(
         artwork_id for artwork_id, _, detail in panels if not detail and artwork_id != primary.id)]
+    path = Path(output_path)
+    if not settings.caption:
+        _save(canvas, path)
+        return RenderResult(path, decision.caption_anchor, crops, "none", artwork_rect, matte_color)
     matte_caption = (_matte_caption(canvas, artwork_rect, decision, primary, companions, settings)
                      if artwork_rect and matte_color else None)
     if matte_caption:
@@ -633,9 +638,12 @@ def render_wallpaper(decision: CuratorDecision, artworks: Mapping[str, Artwork],
                 draw.text((x + 1, y + 2), line, font=font, fill=(16, 17, 17), anchor="lt")
                 draw.text((x, y), line, font=font, fill=color, anchor="lt")
         y += spacing
-    path = Path(output_path)
+    _save(canvas, path)
+    return RenderResult(path, anchor, crops, placement, artwork_rect, matte_color)
+
+
+def _save(canvas: Image.Image, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(path.name + ".tmp")
     canvas.save(temp, format="PNG", optimize=True)
     temp.replace(path)
-    return RenderResult(path, anchor, crops, placement, artwork_rect, matte_color)
