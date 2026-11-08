@@ -18,7 +18,7 @@ from artwall.app.details import details, when  # noqa: E402
 from artwall.app.explain import CSS as EXPLAIN_CSS, open_explain  # noqa: E402
 from artwall.app.preferences import Preferences  # noqa: E402
 from artwall.app.widgets import Background, label, picture, vbox  # noqa: E402
-from artwall.gallery import Gallery, Record, State  # noqa: E402
+from artwall.gallery import WHY_SLOW, Gallery, Record, State  # noqa: E402
 from artwall.launcher import APP_ID, DATA  # noqa: E402
 from artwall.rotation import Vote  # noqa: E402
 
@@ -237,7 +237,7 @@ class ArtwallWindow(Adw.ApplicationWindow):  # type: ignore[misc]
             return
         confirm = Adw.AlertDialog(heading="Regenerate All Upcoming Wallpapers?",
                                   body="The prepared queue is replaced with newly curated wallpapers using different "
-                                       "works. This uses the curator model and may take a few minutes.")
+                                       "works. " + WHY_SLOW)
         confirm.add_response("cancel", "Cancel")
         confirm.add_response("regenerate", "Regenerate")
         confirm.set_response_appearance("regenerate", Adw.ResponseAppearance.SUGGESTED)

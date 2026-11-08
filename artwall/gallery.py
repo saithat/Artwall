@@ -34,6 +34,8 @@ from artwall.systemd import next_rotation, restart_rotation, update_rotate_timer
 
 LOG = logging.getLogger(__name__)
 BATCH = 3  # Wallpapers made by one "Prepare new wallpapers" request.
+WHY_SLOW = ("Each one downloads new full-size museum images (about one per second, as the museum asks) "
+            "and asks the curator model 2–4 times, so allow a minute or more per wallpaper.")
 MAX_COMMENT = 5000
 
 
@@ -367,8 +369,7 @@ class Gallery:
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             total = count if count is not None else self.settings().queue_size
             self._preparation = Preparation(
-                "running", 0, f"Preparing up to {total} wallpaper{'s' if total != 1 else ''} with your saved "
-                              "settings. This may take a few minutes.", total)
+                "running", 0, f"Preparing up to {total} wallpaper{'s' if total != 1 else ''}. {WHY_SLOW}", total)
             Thread(target=self._watch_preparation, args=(process, total), daemon=True).start()
         return "Preparing new wallpapers. You can keep using Artwall."
 
@@ -383,7 +384,7 @@ class Gallery:
                     count += 1
                     with self._lock:
                         self._preparation = Preparation(
-                            "running", count, f"{count} of {total} wallpapers ready. Still preparing…", total)
+                            "running", count, f"{count} of {total} wallpapers ready. {WHY_SLOW}", total)
                 else:
                     LOG.warning("curator: %s", line.rstrip())
         result = process.wait()
