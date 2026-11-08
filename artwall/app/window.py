@@ -244,6 +244,14 @@ class ArtwallWindow(Adw.ApplicationWindow):  # type: ignore[misc]
         confirm.connect("response", self._confirmed_regenerate)
         confirm.present(self)
 
+    def _prepare_clicked(self) -> None:
+        """The Coming Next button: Regenerate All, or Cancel while wallpapers are being prepared."""
+        if self.gallery.preparation().status == "running":
+            self.prepare_button.set_sensitive(False)
+            self.background.run(self.gallery.cancel_preparation, self.toast, lambda exc: self.toast(str(exc)))
+        else:
+            self.regenerate()
+
     def _confirmed_regenerate(self, _dialog: Any, response: str) -> None:
         if response == "regenerate":
             self._start_regenerating(None)
@@ -271,8 +279,11 @@ class ArtwallWindow(Adw.ApplicationWindow):  # type: ignore[misc]
     def _poll_preparation(self) -> bool:
         progress = self.gallery.preparation()
         running = progress.status == "running"
-        self.prepare_button.set_sensitive(not running)
-        self.prepare_button.set_label("Preparing…" if running else "Regenerate All")
+        cancelling = running and not self.prepare_button.get_sensitive() and self.prepare_button.get_label() == "Cancel"
+        self.prepare_button.set_sensitive(not cancelling)
+        self.prepare_button.set_label("Cancel" if running else "Regenerate All")
+        for style, on in (("destructive-action", running), ("suggested-action", not running)):
+            (self.prepare_button.add_css_class if on else self.prepare_button.remove_css_class)(style)
         self.prepare_status.set_label(progress.message)
         if progress.prepared != self.prepared or not running:
             self.prepared = progress.prepared
@@ -336,7 +347,7 @@ class ArtwallWindow(Adw.ApplicationWindow):  # type: ignore[misc]
         self.prepare_status.set_hexpand(True)
         self.prepare_button = Gtk.Button(label="Regenerate All", css_classes=["suggested-action", "pill"],
                                          valign=Gtk.Align.CENTER)
-        self.prepare_button.connect("clicked", lambda _button: self.regenerate())
+        self.prepare_button.connect("clicked", lambda _button: self._prepare_clicked())
         bar.append(self.prepare_status)
         bar.append(self.prepare_button)
         box.append(bar)

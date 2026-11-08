@@ -10,8 +10,10 @@ from dataclasses import dataclass, field, replace
 from itertools import islice
 import json
 import logging
+import os
 from pathlib import Path
 import re
+import signal
 import secrets
 import shutil
 import subprocess
@@ -102,7 +104,7 @@ class State:
         return next((record for record in records if record and record.id == composition_id), None)
 
 
-PreparationStatus = Literal["idle", "running", "ready", "error"]
+PreparationStatus = Literal["idle", "running", "ready", "error", "cancelled"]
 
 
 @dataclass(frozen=True)
@@ -122,6 +124,8 @@ class Gallery:
     _vote_lock: Lock = field(default_factory=Lock, repr=False)  # A vote and its rotation are one step.
     _lock: Lock = field(default_factory=Lock, repr=False)  # Guards the preparation status.
     _preparation: Preparation = Preparation("idle", 0, "Uses your saved settings and feedback. New wallpapers go first.")
+    _process: subprocess.Popen[str] | None = field(default=None, repr=False)
+    _cancelled: bool = False
 
     def _database(self) -> Database:
         return Database(self.database_path)
@@ -366,12 +370,28 @@ class Gallery:
             command = [sys.executable, "-P", "-m", "artwall.cli", "curate"]
             if count is not None:
                 command += ["--count", str(count), "--next", "--avoid", ",".join(avoid)]
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            # Its own process group, so cancelling also stops an agent CLI it started.
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                       start_new_session=True)
+            self._process, self._cancelled = process, False
             total = count if count is not None else self.settings().queue_size
             self._preparation = Preparation(
                 "running", 0, f"Preparing up to {total} wallpaper{'s' if total != 1 else ''}. {WHY_SLOW}", total)
             Thread(target=self._watch_preparation, args=(process, total), daemon=True).start()
         return "Preparing new wallpapers. You can keep using Artwall."
+
+    def cancel_preparation(self) -> str:
+        """Stop preparing wallpapers; those already finished stay in the queue."""
+        with self._lock:
+            process = self._process
+            if process is None or self._preparation.status != "running":
+                return "Nothing is being prepared."
+            self._cancelled = True
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # It finished just now.
+        return "Cancelling…"
 
     def _watch_preparation(self, process: subprocess.Popen[str], total: int) -> None:
         assert process.stdout is not None
@@ -388,7 +408,12 @@ class Gallery:
                 else:
                     LOG.warning("curator: %s", line.rstrip())
         result = process.wait()
-        if result == 0:
+        with self._lock:
+            cancelled, self._process = self._cancelled, None
+        if cancelled:
+            final = Preparation("cancelled", count, f"Cancelled. {_kept(count)} The hourly curation fills the rest "
+                                                    "of the queue.")
+        elif result == 0:
             final = Preparation("ready", count,
                                 f"{count} new wallpaper{'s' if count != 1 else ''} ready at the front of Coming next.")
         elif count:
@@ -399,6 +424,10 @@ class Gallery:
                                 "No new wallpapers could be prepared. Check the museum connection and try again.")
         with self._lock:
             self._preparation = final
+
+
+def _kept(count: int) -> str:
+    return f"{count} new wallpaper{'s were' if count != 1 else ' was'} kept." if count else "No new wallpapers were kept."
 
 
 _MODEL_SETTINGS = {"model_provider", "model_url", "agent", "api_key_env", "api_key_file"}

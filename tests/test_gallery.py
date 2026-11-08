@@ -2,6 +2,7 @@
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import socket
 from pathlib import Path
 import time
 from typing import Any
@@ -105,6 +106,27 @@ class GalleryTests(HomeTest):
         self.assertEqual(len(self.queued()), 2)
         self.assertNotIn(replacement.id, self.queued())
         self.assertEqual(self.current().id, "current")
+
+    def test_cancelling_stops_a_preparation_that_waits_on_the_model(self):
+        silent = socket.socket()  # Accepts connections and never answers, like a stuck model server.
+        silent.bind(("127.0.0.1", 0))
+        silent.listen(8)
+        self.addCleanup(silent.close)
+        self.config_file.write_text(self.config.replace("[llm]\n", f'[llm]\nprovider = "openai"\n'
+                                                          f'base_url = "http://127.0.0.1:{silent.getsockname()[1]}/v1"\n'))
+        with self.database() as db:
+            db.upsert_artwork(self.artwork("slow", (1600, 1200), title="A Slow Choice"))
+        self.assertEqual(self.gallery.cancel_preparation(), "Nothing is being prepared.")
+        self.gallery.start_preparation(1)
+        time.sleep(1.5)  # Long enough to be waiting on the model.
+        self.assertEqual(self.gallery.preparation().status, "running")
+        started = time.monotonic()
+        self.assertEqual(self.gallery.cancel_preparation(), "Cancelling…")
+        preparation = self.wait_for_preparation()
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(preparation.status, "cancelled")
+        self.assertIn("No new wallpapers were kept", preparation.message)
+        self.assertEqual(self.queued(), ["queued"])
 
     def test_failed_preparation_keeps_the_existing_queue_available(self):
         self.config_file.write_text(self.config.replace("[llm]\n", "[llm]\nenabled = false\n"))
