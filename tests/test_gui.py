@@ -1,5 +1,6 @@
 """End-to-end gallery scenarios over real loopback HTTP."""
 
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import time
 from typing import Any
@@ -9,9 +10,9 @@ from unittest.mock import patch
 
 from hypothesis import example, given, settings, strategies as st
 
-from artwall.config import config_path, data_dir, database_path, load_config
+from artwall.config import config_path, data_dir, database_path
 from artwall.gui import GuiContext, create_server
-from artwall.models import CuratorDecision, DecisionArtwork
+from artwall.models import CuratorDecision, DecisionArtwork, Whole
 from artwall.systemd import user_unit_dir
 from tests.support import HomeTest
 
@@ -117,23 +118,24 @@ class GalleryTests(HomeTest):
            model=st.text(alphabet='abcXYZ0123:#"\\ ', min_size=1, max_size=20).filter(str.strip))
     @example(interval=1, model="local")
     @example(interval=180, model="llava:latest")
-    def test_settings_edits_preserve_comments_and_update_the_timer(self, interval: int, model: str):
+    def test_settings_are_saved_in_the_database_and_update_the_timer(self, interval: int, model: str):
         timer = user_unit_dir() / "artwall-rotate.timer"
         if not timer.exists():
             self.cli("install-timers", "--no-enable")
-        before = self.config_file.read_text()
+        config = self.config_file.read_text()
+        before = self.state()["settings"]
         status, _ = self.call("/api/settings", {"interval_minutes": interval, "model": model, "max_artworks": 2})
+        self.assertEqual(self.config_file.read_text(), config)  # The gallery never rewrites config.toml.
         if not 15 <= interval <= 1440:
-            self.assertEqual((status, self.config_file.read_text()), (400, before))
+            self.assertEqual((status, self.state()["settings"]), (400, before))
             return
         self.assertEqual(status, 200)
-        saved = self.config_file.read_text()
-        self.assertIn(f"interval_minutes = {interval} # Keep this note", saved)
-        self.assertIn(f"model = {json.dumps(model.strip())} # Local model", saved)
-        configured = load_config()
-        self.assertEqual((configured.interval_minutes, configured.model, configured.max_artworks),
+        saved = self.state()["settings"]
+        self.assertEqual((saved["interval_minutes"], saved["model"], saved["max_artworks"]),
                          (interval, model.strip(), 2))
         self.assertIn(f"OnUnitActiveSec={interval}min", timer.read_text())
+        # Commands see the saved values too, over config.toml.
+        self.assertIn(f"interval_minutes = {interval}", self.cli("status"))
 
     def test_artwork_and_artist_blacklists_filter_independently(self):
         with self.database() as db:
@@ -188,13 +190,13 @@ class GalleryTests(HomeTest):
                            museum_description="A dark hillside slopes down to the water.")
         with self.database() as db:
             db.upsert_artwork(art)
-        draft = CuratorDecision("near_single", art.id, (DecisionArtwork(art.id),),
+        draft = CuratorDecision(Whole(DecisionArtwork(art.id)),
                                 description=art.museum_description)
-        with patch("artwall.curation.OllamaCurator._chat", return_value=draft.to_dict()) as chat:
+        with patch("artwall.curation.ModelCurator._chat", return_value=draft.to_dict()) as chat:
             self.cli("curate", "--count", "1")
         prompt = chat.call_args.args[0]
         feedback = json.loads(prompt.split("\nViewer feedback: ", 1)[1].split("\nCandidates: ", 1)[0])
-        self.assertEqual(feedback, [{"layout": "near_single",
+        self.assertEqual(feedback, [{"layout": "single",
                                      "works": [{"title": "The Lighthouse", "artist": "A Painter"}],
                                      "comment": comment}])
         self.assertIn("cannot change museum facts", prompt)
@@ -210,6 +212,56 @@ class GalleryTests(HomeTest):
         self.post("/api/comment", {"id": "current", "comment": " \n "})
         with self.database() as db:
             self.assertEqual(db.curation_feedback(), [])
+
+    def test_openai_compatible_endpoint_curates_and_lists_models(self):
+        art = self.artwork("api", (1800, 1400), title="Harbor at Dusk", artist="An Etcher",
+                           museum_description="Boats rest in a quiet harbor beneath a low evening sky.")
+        with self.database() as db:
+            db.upsert_artwork(art)
+        answer = CuratorDecision(Whole(DecisionArtwork(art.id)),
+                                 description=art.museum_description, curator_reason="Calm harbor.").to_dict()
+        requests: list[tuple[str, str | None, dict[str, Any]]] = []
+
+        class FakeApi(BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def reply(self, status: int, body: Any) -> None:
+                data = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self) -> None:
+                self.reply(200, {"data": [{"id": "vision-b"}, {"id": "vision-a"}]})
+
+            def do_POST(self) -> None:
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                requests.append((self.path, self.headers.get("Authorization"), body))
+                if "response_format" in body:  # A server without JSON mode, such as some local runners.
+                    return self.reply(400, {"error": "response_format is not supported"})
+                self.reply(200, {"choices": [{"message": {
+                    "content": "<think>Weighing the harbor.</think>" + json.dumps(answer)}}]})
+
+        base = self.serve(ThreadingHTTPServer(("127.0.0.1", 0), FakeApi))
+        key_file = self.root / "api_key"
+        key_file.write_text("secret-key\n")
+        self.config_file.write_text(f'[display]\nwidth = 860\nheight = 360\n[llm]\nprovider = "openai"\n'
+                                    f'base_url = "{base}/v1"\nmodel = "vision-a"\napi_key_file = "{key_file}"\n')
+        self.cli("curate", "--count", "1")
+        path, auth, retried = requests[-1]
+        self.assertEqual((path, auth), ("/v1/chat/completions", "Bearer secret-key"))
+        self.assertEqual(set(retried), {"model", "messages"})
+        selection = requests[0][2]["messages"][0]["content"]
+        self.assertEqual(selection[1]["type"], "image_url")
+        self.assertTrue(selection[1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+        with self.database() as db:
+            (composition,) = [item for item in db.list_compositions(only_unshown=True) if art.id in item.artwork_ids]
+        self.assertNotIn("unavailable or invalid", composition.decision.curator_reason)
+        status, body = self.call("/api/models")
+        self.assertEqual((status, json.loads(body)["models"]), (200, ["vision-a", "vision-b"]))
 
     def test_reactions_are_exclusive_and_a_favorite_includes_a_like(self):
         # Each press toggles one vote; a thumbs down also drops the work from the queue.
@@ -230,8 +282,8 @@ class GalleryTests(HomeTest):
                 db.set_comment(f"noted-{index}", f"Note {index}: " + "x" * 790)
             art = self.artwork("future", (1800, 1400), title="A Museum Title")
             db.upsert_artwork(art)
-        draft = CuratorDecision("near_single", art.id, (DecisionArtwork(art.id),))
-        with patch("artwall.curation.OllamaCurator._chat", return_value=draft.to_dict()) as chat:
+        draft = CuratorDecision(Whole(DecisionArtwork(art.id)))
+        with patch("artwall.curation.ModelCurator._chat", return_value=draft.to_dict()) as chat:
             self.cli("curate", "--count", "1")
         selection = chat.call_args_list[0]
         block = selection.args[0].split("\nViewer feedback: ", 1)[1].split("\nCandidates: ", 1)[0]

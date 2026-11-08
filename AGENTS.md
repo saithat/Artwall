@@ -5,7 +5,7 @@ museum facts authoritative, and rotation usable without a network or model.
 
 ## Start here
 
-- Read `README.md` for the current behavior and `CONTRIBUTING.md` for setup.
+- Read `README.md` for the current behavior and setup.
 - Run `bash scripts/check` before and after a change. Its tests need no network,
   museum account, graphical session, or running model.
 - Keep each change focused. Do not rewrite unrelated modules or add a framework
@@ -19,7 +19,7 @@ museum facts authoritative, and rotation usable without a network or model.
 - `artwall/render.py`: deterministic wallpaper layouts and captions.
 - `artwall/storage.py`: SQLite catalog, queue, history, and feedback.
 - `artwall/rotation.py`: offline rotation, navigation history, and votes.
-- `artwall/desktop/`: wallpaper and lock-screen adapters.
+- `artwall/desktop/`: wallpaper, lock-screen, and display-size adapters per desktop.
 - `artwall/config.py`: TOML configuration and validation.
 - `artwall/cli.py`: command orchestration; keep substantial logic in modules.
 - `artwall/gui.py` and `artwall/gui_assets/`: local gallery API and interface.
@@ -35,12 +35,13 @@ museum facts authoritative, and rotation usable without a network or model.
 - The renderer never stretches or recolors artwork. Its output dimensions
   match the configured display. A single artwork is the default.
 - Platform-specific wallpaper, lock-screen, and scheduling behavior belongs
-  behind adapters. Do not introduce a Niri or systemd dependency into the
+  behind adapters. Do not introduce a desktop-environment or systemd dependency into the
   source, curation, storage, or rendering modules.
 - Default tests are end-to-end scenarios through the CLI and gallery server,
   in a temporary home with fake desktop commands on PATH (`tests/support.py`).
   Network, Ollama, and desktop commands are not prerequisites for `scripts/check`.
-  The explicit `scripts/check-model` uses a real local Ollama vision model.
+  The explicit `scripts/check-model` uses a real vision model, and
+  `scripts/check-desktops` runs the desktop backends against real tools in a container.
 
 When changing a contract, update the relevant test and README in the same
 change. Add a new dependency only when its concrete benefit outweighs the

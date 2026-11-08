@@ -21,17 +21,18 @@ from PIL import Image
 
 from artwall.cli import main
 from artwall.config import data_dir, database_path
-from artwall.models import Artwork, Composition, CuratorDecision, DecisionArtwork
+from artwall.models import Artwork, Composition, CuratorDecision, DecisionArtwork, arrangement_from_layout
 from artwall.storage import Database
 
 _FAKE_COMMAND = """#!/bin/sh
 if [ -e "{down}" ]; then echo "ERROR: no DMS session"; exit 0; fi
 printf '%s\\n' "{name} $*" >> "{log}"
+if [ -e "$0.out" ]; then while IFS= read -r line || [ -n "$line" ]; do printf '%s\\n' "$line"; done < "$0.out"; fi
 """
 
 
 class HomeTest(unittest.TestCase):
-    """A temporary home with an 860 × 360 display and fake `dms`, `systemctl`, and `artwall` commands."""
+    """A temporary home with an 860 × 360 display and fake `dms`, `systemctl`, and `artwall` commands in a Niri session."""
 
     config = "[display]\nwidth = 860\nheight = 360\n"
 
@@ -41,21 +42,29 @@ class HomeTest(unittest.TestCase):
         self.root = Path(directory.name)
         self.commands_log = self.root / "commands.log"
         self.desktop_down = self.root / "desktop-down"
-        bin_dir = self.root / "bin"
-        bin_dir.mkdir()
+        self.bin_dir = self.root / "bin"
+        self.bin_dir.mkdir()
         for name in ("dms", "systemctl", "artwall"):
-            script = bin_dir / name
-            script.write_text(_FAKE_COMMAND.format(name=name, down=self.desktop_down, log=self.commands_log))
-            script.chmod(0o755)
+            self.fake_command(name)
         environment = {f"XDG_{kind}_HOME": str(self.root / kind.lower()) for kind in ("CONFIG", "DATA", "CACHE")}
         # Only the fake commands are on PATH, and loopback HTTP never goes through a proxy.
-        patcher = patch.dict(os.environ, {**environment, "PATH": str(bin_dir), "no_proxy": "*", "NO_PROXY": "*"})
+        # A Niri session without its own wallpaper setter, so "auto" finds the fake DMS.
+        patcher = patch.dict(os.environ, {**environment, "PATH": str(self.bin_dir), "no_proxy": "*", "NO_PROXY": "*",
+                                          "XDG_CURRENT_DESKTOP": "niri", "DISPLAY": "", "WAYLAND_DISPLAY": "wayland-1"})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.config_file = self.root / "config" / "artwall" / "config.toml"
         self.config_file.parent.mkdir(parents=True)
         self.configure()
         self.clock = 0.0
+
+    def fake_command(self, name: str, output: str = "") -> None:
+        """Put a logging command on PATH that prints ``output``."""
+        script = self.bin_dir / name
+        script.write_text(_FAKE_COMMAND.format(name=name, down=self.desktop_down, log=self.commands_log))
+        script.chmod(0o755)
+        if output:
+            (self.bin_dir / f"{name}.out").write_text(output)
 
     def configure(self, extra: str = "") -> None:
         self.config_file.write_text(self.config + extra)
@@ -103,8 +112,9 @@ class HomeTest(unittest.TestCase):
         image = data_dir() / "compositions" / f"{identifier}.png"
         image.parent.mkdir(parents=True, exist_ok=True)
         Image.new("RGB", (860, 360), "#282828").save(image)
-        layout = fields.pop("layout", ("near_single", "diptych", "triptych")[len(works) - 1])
-        chosen = CuratorDecision(layout, works[0].id, tuple(DecisionArtwork(art.id) for art in works), **fields)
+        layout = fields.pop("layout", ("single", "diptych", "triptych")[len(works) - 1])
+        arrangement = arrangement_from_layout(layout, works[0].id, [DecisionArtwork(art.id) for art in works])
+        chosen = CuratorDecision(arrangement, **fields)
         composition = Composition(identifier, chosen, str(image), created_at=self.clock)
         db.add_composition(composition)
         return composition

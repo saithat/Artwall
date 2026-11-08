@@ -1,0 +1,17 @@
+# Real wallpaper and display tools for several Linux desktops, run headless.
+# Used by scripts/check-desktops; not part of the offline scripts/check.
+FROM registry.fedoraproject.org/fedora:44
+RUN dnf -y --setopt=install_weak_deps=False --setopt=optional_metadata_types=filelists install \
+        python3 python3-pillow \
+        /usr/bin/dbus-run-session /usr/bin/gsettings dconf gsettings-desktop-schemas \
+        /usr/share/glib-2.0/schemas/org.cinnamon.desktop.background.gschema.xml \
+        /usr/share/glib-2.0/schemas/org.mate.background.gschema.xml \
+        /usr/bin/xfconf-query \
+        /usr/bin/kwriteconfig6 /usr/bin/kreadconfig6 \
+        /usr/bin/sway /usr/bin/swaybg /usr/bin/swaymsg \
+        /usr/bin/Xvfb /usr/bin/xrandr /usr/bin/feh \
+    && dnf clean all
+ENV PYTHONDONTWRITEBYTECODE=1 XDG_RUNTIME_DIR=/run/artwall-xdg
+RUN mkdir -m 700 /run/artwall-xdg
+WORKDIR /src
+CMD ["dbus-run-session", "--", "bash", "tests/desktops/run.sh"]

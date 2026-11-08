@@ -10,7 +10,7 @@ from typing import Callable
 
 from artwall.config import cache_dir, config_home, write_atomic
 
-from .wallpaper import DesktopBackendError, image_path, run_backend_command
+from .wallpaper import DesktopBackendError, current_desktops, image_path, run_backend_command
 
 
 class LockScreenBackend(ABC):
@@ -109,23 +109,63 @@ class HyprlockBackend(LockScreenBackend):
             write_atomic(config, updated)
 
 
+class SwaylockBackend(LockScreenBackend):
+    """Point swaylock's config at the stable ``current.png`` link once."""
+
+    def __init__(self, *, config_path: str | Path | None = None, current_path: str | Path | None = None) -> None:
+        self.config_path = Path(config_path) if config_path is not None else config_home() / "swaylock" / "config"
+        self.current_path = Path(current_path) if current_path is not None else cache_dir() / "current.png"
+
+    def configure(self, path: str | Path) -> None:
+        image_path(path)
+        if shutil.which("swaylock") is None:
+            raise DesktopBackendError("Desktop command is not installed: swaylock")
+        config = self.config_path.expanduser().absolute()
+        if config.is_symlink():
+            raise DesktopBackendError(f"swaylock config is a symlink; set its image path manually: {config}")
+        line = f"image={self.current_path.expanduser().absolute()}"
+        original = config.read_text(encoding="utf-8") if config.exists() else ""
+        pattern = re.compile(r"(?m)^[ \t]*image[ \t]*=[^\n]*$")
+        if pattern.search(original):
+            updated = pattern.sub(lambda _: line, original)
+        else:
+            updated = (original.rstrip() + "\n" if original.strip() else "") + line + "\n"
+        if updated != original:
+            write_atomic(config, updated)
+
+
+class KdeLockScreenBackend(LockScreenBackend):
+    """Set the Plasma lock-screen image through ``kscreenlockerrc``."""
+
+    def configure(self, path: str | Path) -> None:
+        tool = next((name for name in ("kwriteconfig6", "kwriteconfig5") if shutil.which(name)), "kwriteconfig6")
+        groups = [arg for group in ("Greeter", "Wallpaper", "org.kde.image", "General") for arg in ("--group", group)]
+        run_backend_command([tool, "--file", "kscreenlockerrc", *groups, "--key", "Image", image_path(path).as_uri()])
+
+
 class NoLockScreenBackend(LockScreenBackend):
-    """Use when the user intentionally keeps a separate lock-screen image."""
+    """For lock screens that follow the wallpaper (GNOME, Cinnamon) or keep their own image."""
 
     def configure(self, path: str | Path) -> None:
         return None
 
 
 _LOCKERS: dict[str, Callable[[], LockScreenBackend]] = {
-    "dms": DmsLockScreenBackend, "hyprlock": HyprlockBackend, "none": NoLockScreenBackend, "off": NoLockScreenBackend,
+    "dms": DmsLockScreenBackend, "hyprlock": HyprlockBackend, "swaylock": SwaylockBackend,
+    "kde": KdeLockScreenBackend, "none": NoLockScreenBackend, "off": NoLockScreenBackend,
 }
+
+
+def lock_screen_backend_name() -> str:
+    """The locker "auto" selects; "none" when the lock screen needs no separate image."""
+    if "kde" in current_desktops() and (shutil.which("kwriteconfig6") or shutil.which("kwriteconfig5")):
+        return "kde"
+    return next((name for name in ("dms", "hyprlock", "swaylock") if shutil.which(name)), "none")
 
 
 def lock_screen_backend(name: str = "auto") -> LockScreenBackend:
     if name == "auto":
-        name = next((candidate for candidate in ("dms", "hyprlock") if shutil.which(candidate)), "")
-        if not name:
-            raise DesktopBackendError("No lock-screen backend found (install DMS or Hyprlock, or configure 'none')")
+        name = lock_screen_backend_name()
     if name not in _LOCKERS:
-        raise DesktopBackendError(f"Unknown lock-screen backend: {name}")
+        raise DesktopBackendError(f"Unknown lock-screen backend: {name} (choose from {', '.join(_LOCKERS)})")
     return _LOCKERS[name]()

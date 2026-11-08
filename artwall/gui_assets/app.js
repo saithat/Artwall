@@ -128,7 +128,7 @@ function commentForm(record, location) {
   text.rows = 3;
   text.placeholder = "Too much empty space? An awkward pairing? Tell the curator what works and what to change.";
   text.value = commentDrafts.get(record.id) ?? record.comment ?? "";
-  const help = node("p", "field-note", "Saved on this device. Your local model uses this feedback when preparing future wallpapers.");
+  const help = node("p", "field-note", "Saved on this device. The curator model uses this feedback when preparing future wallpapers.");
   help.id = `${inputId}Help`;
   text.setAttribute("aria-describedby", help.id);
   text.addEventListener("input", () => {
@@ -313,6 +313,7 @@ async function changeBlacklist(kind, payload) {
 }
 
 function renderSettings() {
+  document.documentElement.style.setProperty("--display-aspect", `${gallery.settings.width}/${gallery.settings.height}`);
   $("interval").value = gallery.settings.interval_minutes;
   $("model").value = gallery.settings.model;
   const chosen = document.querySelector(`input[name="count"][value="${gallery.settings.max_artworks}"]`);
@@ -364,8 +365,8 @@ async function loadModels() {
       options.append(option);
     }
     $("modelHelp").textContent = result.models.length ?
-      `${result.models.length} installed Ollama model${result.models.length === 1 ? "" : "s"} found. Choose one with vision support for artwork curation.` :
-      "No local Ollama models detected right now. You can still enter a model name.";
+      `${result.models.length} model${result.models.length === 1 ? "" : "s"} found at the configured endpoint. Choose one with vision support for artwork curation.` :
+      "No models listed by the configured endpoint right now. You can still enter a model name.";
   } catch { /* The model list is optional; the configured name remains editable. */ }
 }
 

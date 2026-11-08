@@ -5,16 +5,16 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, fields
 import math
 import time
-from typing import Any, Literal, Mapping, cast, get_args
+from typing import Any, Literal, Mapping, Sequence, assert_never, cast, get_args
 
-Layout = Literal["single", "near_single", "diptych", "triptych", "artwork_detail"]
+Layout = Literal["single", "diptych", "triptych", "artwork_detail"]
 Anchor = Literal["bottom_left", "bottom_right", "top_left", "top_right"]
 LAYOUT_COUNTS: dict[Layout, int] = {
-    "single": 1, "near_single": 1, "diptych": 2, "triptych": 3, "artwork_detail": 1,
+    "single": 1, "diptych": 2, "triptych": 3, "artwork_detail": 1,
 }
-# Earlier releases split pairs into fixed 50/50 and 60/40 slots. Both now
-# render as one row sized to the originals, so stored decisions are read as one.
-_LEGACY_LAYOUTS = {"diptych_50": "diptych", "diptych_60": "diptych"}
+# Earlier releases split pairs into fixed 50/50 and 60/40 slots, and named narrow
+# single works near_single. Stored decisions with those names still load.
+_LEGACY_LAYOUTS = {"diptych_50": "diptych", "diptych_60": "diptych", "near_single": "single"}
 ANCHORS: tuple[Anchor, ...] = get_args(Anchor)
 
 
@@ -122,52 +122,134 @@ class DecisionArtwork:
 
 
 @dataclass(frozen=True)
-class CuratorDecision:
-    """A structurally valid layout; curation.validate_decision checks it against museum records."""
+class Whole:
+    """One original: full bleed when wide enough, otherwise against a diffuse surround."""
 
-    layout: Layout
-    primary_artwork_id: str
-    artworks: tuple[DecisionArtwork, ...]
+    work: DecisionArtwork
+
+
+@dataclass(frozen=True)
+class Row:
+    """Two or three whole originals, left to right at a shared height."""
+
+    works: tuple[DecisionArtwork, DecisionArtwork] | tuple[DecisionArtwork, DecisionArtwork, DecisionArtwork]
+    primary: int = 0  # Index of the work the caption is about.
+
+    def __post_init__(self) -> None:
+        ids = [work.id for work in self.works]
+        if len(set(ids)) != len(ids):
+            raise DecisionError("A work cannot appear twice in one composition")
+        if not 0 <= self.primary < len(ids):
+            raise DecisionError("Primary artwork must be selected")
+
+    @classmethod
+    def of(cls, works: Sequence[DecisionArtwork], primary: int = 0) -> Row:
+        if len(works) == 2:
+            return cls((works[0], works[1]), primary)
+        if len(works) == 3:
+            return cls((works[0], works[1], works[2]), primary)
+        raise DecisionError("A row holds two or three works")
+
+
+@dataclass(frozen=True)
+class Detail:
+    """One original beside an enlarged region of itself."""
+
+    work: DecisionArtwork
+    region: Crop | None = None  # None lets the renderer choose a detailed region.
+
+
+Arrangement = Whole | Row | Detail
+
+
+def arrangement_from_layout(layout: object, primary_id: object, works: Sequence[DecisionArtwork],
+                            detail_crop: Crop | None = None) -> Arrangement:
+    """Parse the flat wire form (a layout name, primary ID, and works) used by models and storage."""
+    name = _LEGACY_LAYOUTS.get(layout, layout) if isinstance(layout, str) else layout
+    if name not in LAYOUT_COUNTS:
+        raise DecisionError(f"Unsupported layout: {layout}")
+    if len(works) != LAYOUT_COUNTS[name]:
+        raise DecisionError(f"{name} requires {LAYOUT_COUNTS[name]} artwork(s)")
+    ids = [work.id for work in works]
+    if primary_id not in ids:
+        raise DecisionError("Primary artwork must be selected")
+    if detail_crop is not None and name != "artwork_detail":
+        raise DecisionError("Detail crop only belongs in artwork_detail layout")
+    if name == "artwork_detail":
+        return Detail(works[0], detail_crop)
+    if name == "single":
+        return Whole(works[0])
+    return Row.of(works, ids.index(primary_id))
+
+
+@dataclass(frozen=True)
+class CuratorDecision:
+    """A structurally valid composition; curation.validate_decision checks it against museum records."""
+
+    arrangement: Arrangement
     caption_anchor: Anchor = "bottom_left"
     caption_max_width_px: int = 620
     use_gradient: bool = True
-    detail_crop: Crop | None = None
     relationship: str = ""
     description: str = ""
     curator_reason: str = ""
 
     def __post_init__(self) -> None:
-        ids = self.artwork_ids
-        if self.layout not in LAYOUT_COUNTS:
-            raise DecisionError(f"Unsupported layout: {self.layout}")
-        if len(ids) != LAYOUT_COUNTS[self.layout]:
-            raise DecisionError(f"{self.layout} requires {LAYOUT_COUNTS[self.layout]} artwork(s)")
-        if len(set(ids)) != len(ids):
-            raise DecisionError("A work cannot appear twice in one composition")
-        if self.primary_artwork_id not in ids:
-            raise DecisionError("Primary artwork must be selected")
         if self.caption_anchor not in ANCHORS:
             raise DecisionError(f"Unsupported caption anchor: {self.caption_anchor}")
         if not 320 <= self.caption_max_width_px <= 900:
             raise DecisionError("Caption width must be between 320 and 900 pixels")
-        if self.detail_crop is not None and self.layout != "artwork_detail":
-            raise DecisionError("Detail crop only belongs in artwork_detail layout")
+
+    @property
+    def artworks(self) -> tuple[DecisionArtwork, ...]:
+        match self.arrangement:
+            case Row(works=works):
+                return works
+            case Whole(work=work) | Detail(work=work):
+                return (work,)
+        assert_never(self.arrangement)
 
     @property
     def artwork_ids(self) -> list[str]:
         return [entry.id for entry in self.artworks]
 
+    @property
+    def primary_artwork_id(self) -> str:
+        match self.arrangement:
+            case Row(works=works, primary=primary):
+                return works[primary].id
+            case Whole(work=work) | Detail(work=work):
+                return work.id
+        assert_never(self.arrangement)
+
+    @property
+    def layout(self) -> Layout:
+        """The wire name of the arrangement."""
+        match self.arrangement:
+            case Whole():
+                return "single"
+            case Row(works=works):
+                return "diptych" if len(works) == 2 else "triptych"
+            case Detail():
+                return "artwork_detail"
+        assert_never(self.arrangement)
+
     def to_dict(self) -> dict[str, Any]:
-        value = asdict(self)
-        value["artworks"] = list(value["artworks"])
-        return value
+        """The flat wire form models answer in and storage keeps."""
+        region = self.arrangement.region if isinstance(self.arrangement, Detail) else None
+        return {"layout": self.layout, "primary_artwork_id": self.primary_artwork_id,
+                "artworks": [asdict(entry) for entry in self.artworks],
+                "caption_anchor": self.caption_anchor, "caption_max_width_px": self.caption_max_width_px,
+                "use_gradient": self.use_gradient, "detail_crop": asdict(region) if region else None,
+                "relationship": self.relationship, "description": self.description,
+                "curator_reason": self.curator_reason}
 
     @classmethod
     def from_dict(cls, raw: object) -> CuratorDecision:
         """Parse untrusted JSON into a decision, rejecting unexpected fields and types."""
         if not isinstance(raw, Mapping):
             raise DecisionError("Decision must be a JSON object")
-        if set(raw) - {item.name for item in fields(cls)}:
+        if set(raw) - _WIRE_FIELDS:
             raise DecisionError("Decision contains unsupported fields")
         entries = raw.get("artworks")
         if not isinstance(entries, list):
@@ -185,13 +267,14 @@ class CuratorDecision:
         text = {key: raw.get(key) or "" for key in ("relationship", "description", "curator_reason")}
         if not all(isinstance(value, str) for value in text.values()):
             raise DecisionError("Decision text fields must be strings")
-        # __post_init__ checks the layout, anchor, and primary ID values.
-        layout = raw.get("layout")
-        return cls(layout=cast(Layout, _LEGACY_LAYOUTS.get(layout, layout) if isinstance(layout, str) else layout),
-                   primary_artwork_id=cast(str, raw.get("primary_artwork_id")),
-                   artworks=tuple(artworks), caption_anchor=raw.get("caption_anchor", "bottom_left"),
-                   caption_max_width_px=width, use_gradient=raw.get("use_gradient", True),
-                   detail_crop=Crop.parse(raw.get("detail_crop")), **text)
+        arrangement = arrangement_from_layout(raw.get("layout"), raw.get("primary_artwork_id"), artworks,
+                                              Crop.parse(raw.get("detail_crop")))
+        return cls(arrangement, caption_anchor=raw.get("caption_anchor", "bottom_left"),
+                   caption_max_width_px=width, use_gradient=raw.get("use_gradient", True), **text)
+
+
+_WIRE_FIELDS = {"layout", "primary_artwork_id", "artworks", "caption_anchor", "caption_max_width_px",
+                "use_gradient", "detail_crop", "relationship", "description", "curator_reason"}
 
 
 @dataclass(frozen=True)

@@ -22,12 +22,14 @@ from pathlib import Path
 from threading import Lock, Thread
 from typing import Any, cast
 from urllib.parse import urlsplit
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from PIL import Image, ImageOps
 
 from artwall import rotation
-from artwall.config import Settings, config_path, data_dir, database_path, load_config, update_config_values
+from artwall.config import (
+    Settings, config_path, data_dir, database_path, load_config, model_api_key,
+)
 from artwall.models import Artwork, Composition
 from artwall.storage import Database
 from artwall.systemd import update_rotate_timer, user_unit_dir
@@ -73,7 +75,8 @@ def gallery_state(db: Database, settings: Settings) -> dict[str, Any]:
                    key=lambda art: (art.title.casefold(), (art.artist or "").casefold()))
     return {
         "settings": {"interval_minutes": settings.interval_minutes, "model": settings.model,
-                     "max_artworks": settings.max_artworks},
+                     "max_artworks": settings.max_artworks,
+                     "width": settings.width, "height": settings.height},
         "current": _record_summary(db, current) if current else None,
         "queued": [_record_summary(db, composition) for composition in islice(rotation.upcoming(db, settings), 60)],
         "history": [_record_summary(db, composition) for composition in history],
@@ -83,7 +86,7 @@ def gallery_state(db: Database, settings: Settings) -> dict[str, Any]:
     }
 
 
-def vote_from_gallery(db: Database, config_file: Path, composition_id: str, kind: rotation.Vote,
+def vote_from_gallery(db: Database, configured: Settings, composition_id: str, kind: rotation.Vote,
                       expected_current: str | None) -> str:
     """Toggle a vote; thumbs down on the current wallpaper also rotates to the next one."""
     composition = db.get_composition(composition_id)
@@ -100,7 +103,7 @@ def vote_from_gallery(db: Database, config_file: Path, composition_id: str, kind
     rotation.vote(db, composition, kind, enabled=enabled)
     if kind == "dislike" and is_current:
         try:
-            shown = rotation.advance(db, load_config(config_file))
+            shown = rotation.advance(db, db.settings(configured))
         except rotation.NoAlternativeError:
             return "Thumbs down saved. No other eligible artwork is ready; curate more to continue."
         except (OSError, RuntimeError) as exc:
@@ -113,15 +116,29 @@ def vote_from_gallery(db: Database, config_file: Path, composition_id: str, kind
 
 
 def _installed_models(settings: Settings) -> list[str]:
-    base = urlsplit(settings.ollama_url)
-    if base.scheme != "http" or base.hostname not in {"127.0.0.1", "localhost", "::1"}:
-        return []
+    """Model names the configured endpoint offers, or [] when it cannot be asked quickly."""
+    base_url = settings.model_url.rstrip("/")
+    headers = {}
+    if settings.model_provider == "openai":
+        url, key = base_url + "/models", "data"
+        try:
+            api_key = model_api_key(settings)
+        except OSError:
+            return []
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+    else:
+        base = urlsplit(base_url)
+        if base.scheme != "http" or base.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            return []
+        url, key = base_url + "/api/tags", "models"
+    field_name = "id" if key == "data" else "name"
     try:
-        with urlopen(settings.ollama_url.rstrip("/") + "/api/tags", timeout=2) as response:
+        with urlopen(Request(url, headers=headers), timeout=2) as response:
             value = json.load(response)
-        return sorted({item["name"] for item in value.get("models", [])
-                       if isinstance(item, dict) and isinstance(item.get("name"), str)})
-    except (OSError, ValueError, KeyError, TypeError):
+        return sorted({item[field_name] for item in value.get(key, [])
+                       if isinstance(item, dict) and isinstance(item.get(field_name), str)})
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return []
 
 
@@ -269,14 +286,16 @@ def make_handler(context: GuiContext) -> type[BaseHTTPRequestHandler]:
                     self._file(ASSETS / "app.js", "text/javascript; charset=utf-8")
                 elif path == "/api/state":
                     with Database(context.database_path) as db:
-                        state = gallery_state(db, load_config(context.config_file))
+                        state = gallery_state(db, db.settings(load_config(context.config_file)))
                     state["csrf_token"] = context.token
                     state["preparation"] = context.preparation_state()
                     self._json(200, state)
                 elif path == "/api/preparation":
                     self._json(200, context.preparation_state())
                 elif path == "/api/models":
-                    self._json(200, {"models": _installed_models(load_config(context.config_file))})
+                    with Database(context.database_path) as db:
+                        settings = db.settings(load_config(context.config_file))
+                    self._json(200, {"models": _installed_models(settings)})
                 elif path.startswith("/image/"):
                     self._file(context.image_path(path.removeprefix("/image/")), "image/png")
                 elif path.startswith("/thumb/"):
@@ -325,11 +344,12 @@ def make_handler(context: GuiContext) -> type[BaseHTTPRequestHandler]:
                 if type(count) is not int or count not in (1, 2, 3):
                     raise ValueError("Artwork count must be 1, 2, or 3")
                 if not isinstance(model, str) or not model.strip() or len(model) > 120 or any(ord(ch) < 32 for ch in model):
-                    raise ValueError("Enter a valid local Ollama model name")
-                old = load_config(context.config_file)
-                settings = update_config_values({"rotation": {"interval_minutes": interval},
-                                                 "curation": {"max_artworks": count},
-                                                 "llm": {"model": model.strip()}}, path=context.config_file)
+                    raise ValueError("Enter a valid model name")
+                configured = load_config(context.config_file)
+                with Database(context.database_path) as db:
+                    old = db.settings(configured)
+                    settings = db.save_gallery_settings(configured, {
+                        "interval_minutes": interval, "max_artworks": count, "model": model.strip()})
                 if interval != old.interval_minutes:
                     executable = shutil.which("artwall")
                     if not executable or not update_rotate_timer(
@@ -349,7 +369,8 @@ def make_handler(context: GuiContext) -> type[BaseHTTPRequestHandler]:
                 # ThreadingHTTPServer can handle requests from multiple gallery
                 # tabs at once. Keep feedback and its rotation in one operation.
                 with context.feedback_lock, Database(context.database_path) as db:
-                    return vote_from_gallery(db, context.config_file, composition_id, kind, expected_current)
+                    return vote_from_gallery(db, load_config(context.config_file), composition_id, kind,
+                                             expected_current)
             if path == "/api/comment":
                 composition_id = body.get("id")
                 comment = body.get("comment")

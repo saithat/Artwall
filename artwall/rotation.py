@@ -19,7 +19,7 @@ from PIL import Image
 from artwall.config import Settings, cache_dir, write_atomic
 from artwall.curation import lock_screen_safe
 from artwall.desktop import lock_screen_backend, wallpaper_backend
-from artwall.models import Artwork, Composition
+from artwall.models import Artwork, Composition, Detail
 from artwall.storage import Database
 
 
@@ -116,7 +116,7 @@ def eligible(db: Database, settings: Settings, compositions: Iterable[Compositio
     for composition in compositions:
         ids = composition.artwork_ids
         if (composition.id in disliked or len(ids) > settings.max_artworks
-                or (settings.max_artworks == 1 and composition.decision.layout == "artwork_detail")
+                or (settings.max_artworks == 1 and isinstance(composition.decision.arrangement, Detail))
                 or not _valid_image(composition, settings)):
             continue
         works = [db.get_artwork(artwork_id) for artwork_id in ids]

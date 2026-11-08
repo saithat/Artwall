@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Exercise the desktop backends against real tools in a Fedora container.
+# Needs podman (or docker via CONTAINER=docker) and network access for the first build.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+engine=${CONTAINER:-podman}
+"$engine" build -q -t artwall-desktops -f tests/desktops/Containerfile tests/desktops >/dev/null
+# Fedora installs sway with cap_sys_nice, which it cannot exec without that capability.
+"$engine" run --rm --cap-add SYS_NICE --security-opt label=disable -v "$PWD":/src:ro artwall-desktops

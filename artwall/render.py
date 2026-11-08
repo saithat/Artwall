@@ -9,16 +9,16 @@ from io import BytesIO
 import math
 from pathlib import Path
 import re
-from typing import Mapping, NamedTuple, cast
+from typing import Mapping, NamedTuple, assert_never, cast
 
 from PIL import Image, ImageChops, ImageCms, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageStat
 
-from artwall.models import ANCHORS, Anchor, Artwork, Crop, CuratorDecision, Layout, ratio_fit
+from artwall.models import ANCHORS, Anchor, Arrangement, Artwork, Crop, CuratorDecision, Detail, Row, Whole, ratio_fit
 
 
 RGB = tuple[int, int, int]
 Rect = tuple[int, int, int, int]
-Font = ImageFont.FreeTypeFont | ImageFont.ImageFont
+Font = ImageFont.FreeTypeFont
 RESAMPLE = Image.Resampling.LANCZOS
 PAPER = (235, 219, 178)
 SECONDARY = (213, 196, 161)
@@ -77,7 +77,11 @@ def _font(path: str | None, family: str, size: int) -> Font:
                 return ImageFont.truetype(choice, size)
             except OSError:
                 pass
-    return ImageFont.load_default(size=size)
+    # With a size, Pillow's bundled default is a scalable FreeType font.
+    font = ImageFont.load_default(size=size)
+    if not isinstance(font, ImageFont.FreeTypeFont):
+        raise RuntimeError("Pillow was built without FreeType, which captions need")
+    return font
 
 
 def _open_art(art: Artwork) -> Image.Image:
@@ -298,29 +302,37 @@ def _fit_single(image: Image.Image, settings: RenderSettings, explicit_crop: Cro
     return canvas, box, crop, matte
 
 
-def _panels(layout: Layout, ids: list[str], settings: RenderSettings,
+def _panels(arrangement: Arrangement, settings: RenderSettings,
             ratios: Mapping[str, float]) -> list[tuple[str, Rect, bool]]:
     """Each panel's artwork ID, box, and whether it shows an enlarged detail."""
     w, h, g = settings.width, settings.height, settings.gutter
-    if layout == "artwork_detail":
-        split = round(w * (0.42 if ratios[ids[0]] < 0.95 else 0.69))
-        return [(ids[0], (0, 0, split - g // 2, h), False),
-                (ids[0], (split + g // 2, 0, w, h), True)]
-    if layout in ("diptych", "triptych"):
-        # One aligned row at a common height, with widths following the actual
-        # originals. Fixed slots waste space or crop works of differing shapes.
-        inset = max(2, round(min(w, h) * 0.006))
-        usable = w - 2 * inset - g * (len(ids) - 1)
-        height = max(1, min(h - 2 * inset, int(usable / sum(ratios[i] for i in ids))))
-        widths = [max(1, round(height * ratios[i])) for i in ids]
-        left = (w - sum(widths) - g * (len(ids) - 1)) // 2
-        top = (h - height) // 2
-        panels = []
-        for artwork_id, width in zip(ids, widths):
-            panels.append((artwork_id, (left, top, left + width, top + height), False))
-            left += width + g
-        return panels
-    return [(ids[0], (0, 0, w, h), False)]
+    match arrangement:
+        case Whole(work=work):
+            return [(work.id, (0, 0, w, h), False)]
+        case Detail(work=work):
+            split = round(w * (0.42 if ratios[work.id] < 0.95 else 0.69))
+            return [(work.id, (0, 0, split - g // 2, h), False),
+                    (work.id, (split + g // 2, 0, w, h), True)]
+        case Row(works=works):
+            return _row_panels([entry.id for entry in works], settings, ratios)
+    assert_never(arrangement)
+
+
+def _row_panels(ids: list[str], settings: RenderSettings, ratios: Mapping[str, float]) -> list[tuple[str, Rect, bool]]:
+    """One aligned row at a common height, with widths following the actual
+    originals. Fixed slots waste space or crop works of differing shapes."""
+    w, h, g = settings.width, settings.height, settings.gutter
+    inset = max(2, round(min(w, h) * 0.006))
+    usable = w - 2 * inset - g * (len(ids) - 1)
+    height = max(1, min(h - 2 * inset, int(usable / sum(ratios[i] for i in ids))))
+    widths = [max(1, round(height * ratios[i])) for i in ids]
+    left = (w - sum(widths) - g * (len(ids) - 1)) // 2
+    top = (h - height) // 2
+    panels = []
+    for artwork_id, width in zip(ids, widths):
+        panels.append((artwork_id, (left, top, left + width, top + height), False))
+        left += width + g
+    return panels
 
 
 def _text_wrap(draw: ImageDraw.ImageDraw, text: str, font: Font, max_width: int) -> list[str]:
@@ -405,7 +417,7 @@ def _caption_lines(canvas: Image.Image, decision: CuratorDecision, primary: Artw
 
     def append(text: str, font: Font, color: RGB) -> None:
         wrapped = _text_wrap(draw, text, font, settings.caption_max_width)
-        ink_height = max((draw.textbbox((0, 0), line, font=font, anchor="lt")[3]
+        ink_height = max((math.ceil(draw.textbbox((0, 0), line, font=font, anchor="lt")[3])
                           for line in wrapped), default=0)
         spacing = ink_height + max(2, round(font.size * 0.2))
         lines.extend(_Line(line, font, color, spacing) for line in wrapped)
@@ -542,7 +554,7 @@ def render_wallpaper(decision: CuratorDecision, artworks: Mapping[str, Artwork],
     if any(artwork_id not in artworks for artwork_id in ids):
         raise ValueError("Composition references an unknown artwork")
     images = {artwork_id: _open_art(artworks[artwork_id]) for artwork_id in ids}
-    panels = _panels(decision.layout, ids, settings,
+    panels = _panels(decision.arrangement, settings,
                      {artwork_id: image.width / image.height for artwork_id, image in images.items()})
     size = (settings.width, settings.height)
     crops: dict[str, Crop | None] = {}
@@ -553,7 +565,7 @@ def render_wallpaper(decision: CuratorDecision, artworks: Mapping[str, Artwork],
         artwork_id = panels[0][0]
         canvas, artwork_rect, crops[artwork_id], matte_color = _fit_single(
             images[artwork_id], settings, entry_crops[artwork_id])
-    elif decision.layout != "artwork_detail":
+    elif not isinstance(decision.arrangement, Detail):
         matte_color, _ = _matte_colors(images[decision.primary_artwork_id])
         canvas = _ambient_background(images[decision.primary_artwork_id], size, matte_color)
         _draw_shadows(canvas, [box for _, box, _ in panels])
@@ -566,10 +578,11 @@ def render_wallpaper(decision: CuratorDecision, artworks: Mapping[str, Artwork],
         artwork_rect = (min(box[0] for box in mounted), min(box[1] for box in mounted),
                         max(box[2] for box in mounted), max(box[3] for box in mounted))
     else:
+        region = decision.arrangement.region if isinstance(decision.arrangement, Detail) else None
         canvas = Image.new("RGB", size, GUTTER)
         for artwork_id, box, detail in panels:
             image = images[artwork_id]
-            crop = decision.detail_crop if detail else entry_crops[artwork_id]
+            crop = region if detail else entry_crops[artwork_id]
             if detail and crop is None:
                 # A deterministic enlarged detail. The title always names the same
                 # work, and a subtle in-image label clarifies the second panel.

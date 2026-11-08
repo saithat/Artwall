@@ -1,25 +1,16 @@
 """Desktop and lock-screen adapters for rendered artwall compositions."""
 
-from .lockscreen import DmsLockScreenBackend, HyprlockBackend, LockScreenBackend, NoLockScreenBackend, lock_screen_backend
-from .wallpaper import (
-    AwwwBackend,
-    DesktopBackendError,
-    DmsBackend,
-    SwwwBackend,
-    WallpaperBackend,
-    wallpaper_backend,
-)
+from .display import detect_display_size
+from .lockscreen import LockScreenBackend, lock_screen_backend, lock_screen_backend_name
+from .wallpaper import DesktopBackendError, WallpaperBackend, wallpaper_backend, wallpaper_backend_name
 
 __all__ = [
-    "AwwwBackend",
     "DesktopBackendError",
-    "DmsBackend",
-    "DmsLockScreenBackend",
-    "HyprlockBackend",
     "LockScreenBackend",
-    "NoLockScreenBackend",
-    "SwwwBackend",
     "WallpaperBackend",
+    "detect_display_size",
     "lock_screen_backend",
+    "lock_screen_backend_name",
     "wallpaper_backend",
+    "wallpaper_backend_name",
 ]

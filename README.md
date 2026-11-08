@@ -1,12 +1,12 @@
 # Artwall
 
-A local, open-source-friendly museum curator for a Wayland desktop. It discovers public-domain works from the Art Institute of Chicago, asks a **local vision model** to select and compose them, renders 3440 × 1440 wallpapers with small editorial captions, and keeps a ready-to-show offline queue. One artwork per wallpaper is the default.
+A local museum curator for Linux desktops. It discovers public-domain works from the Art Institute of Chicago, asks a **vision model** (local by default, through Ollama or any OpenAI-compatible API) to select and compose them, renders wallpapers at your display's resolution with small editorial captions, and keeps a ready-to-show offline queue. One artwork per wallpaper is the default.
 
 Artwork is never generated or recolored. The museum supplies titles, artists, dates, rights, and source pages. The model chooses the work, layout, and short source-grounded caption. Rendering is deterministic. A narrow work remains intact against a softly blurred, subdued backdrop drawn from its colors. A fine border and soft shadow distinguish the sharp original from its surround, with the caption in the exposed space when it fits.
 
 ## First wallpaper
 
-This Fedora/Niri setup has DMS (DankMaterialShell), which artwall auto-detects for both desktop wallpaper and lock screen. `awww` and `swww` wallpaper adapters are also available if installed. The same rendered composition is sent to the desktop and DMS lock screen.
+Artwall supports GNOME, KDE Plasma, Xfce, Cinnamon, MATE, Sway, Niri, Hyprland, and X11 window managers. `artwall init` detects your display size, and the default `auto` backend picks the right wallpaper and lock-screen setter for the running session (see [Desktop support](#desktop-support)).
 
 ```bash
 uv tool install --editable .
@@ -16,9 +16,9 @@ artwall curate --count 3
 artwall next
 ```
 
-`artwall next --no-apply` updates the local current composition without contacting the graphical session; it is useful from a terminal outside Niri. The canonical current files are `~/.cache/artwall/current.png` and `current.json` (unless XDG paths are customized). Source originals and queued PNGs live under `~/.local/share/artwall/`.
+`artwall next --no-apply` updates the local current composition without contacting the graphical session; it is useful from a terminal outside the graphical session. The canonical current files are `~/.cache/artwall/current.png` and `current.json` (unless XDG paths are customized). Source originals and queued PNGs live under `~/.local/share/artwall/`.
 
-The default local curator is the installed `qwen3.6:27b` vision model through Ollama. Keep the Ollama daemon running when preparing new compositions. A failed or unavailable model falls back to deterministic, metadata-based curation. Rotation itself never calls Ollama or a museum API. To prepare a queue entirely without the model:
+The default local curator is the `qwen3.6:27b` vision model through Ollama (`ollama pull qwen3.6:27b`, or set `[llm].model` to another vision model you have installed). Keep the Ollama daemon running when preparing new compositions. A failed or unavailable model falls back to deterministic, metadata-based curation. Rotation itself never calls Ollama or a museum API. To prepare a queue entirely without the model:
 
 ```bash
 artwall curate --offline --count 5
@@ -49,11 +49,11 @@ artwall curate --count 14       Prepare future wallpapers
 artwall curate --count 3 --next Prepare wallpapers to show ahead of the old queue
 ```
 
-The commands are intentionally small so they can be bound in `~/.config/niri/config.kdl`. For example, a Niri `spawn` binding can run `artwall next` or `artwall favorite`; see Niri's syntax for the version installed on your machine.
+The commands are intentionally small so they can be bound to keyboard shortcuts in your desktop's settings or your compositor's config (for example a Niri `spawn`, Hyprland `bind = ..., exec, artwall next`, or Sway `bindsym ... exec artwall next`).
 
 ## Local interface
 
-Run `artwall gui` to open the local interface at `http://127.0.0.1:8765`. It shows the current wallpaper, upcoming rotation, and history. You can like, dislike, or comment on a composition; set the rotation interval and local Ollama model; maintain artist and artwork blacklists; and allow one, two, or three concurrent works. It serves only on loopback and uses no remote web assets. The command `artwall gui --no-open` starts the interface without opening a browser.
+Run `artwall gui` to open the local interface at `http://127.0.0.1:8765`. It shows the current wallpaper, upcoming rotation, and history. You can like, dislike, or comment on a composition; set the rotation interval and curator model; maintain artist and artwork blacklists; and allow one, two, or three concurrent works. It serves only on loopback and uses no remote web assets. The command `artwall gui --no-open` starts the interface without opening a browser.
 
 **Prepare new wallpapers**, beside **Coming next**, prepares up to three wallpapers in the background using saved settings and feedback. Progress and failures appear beside the button. New results go to the front of the queue; the current wallpaper, older queued work, history, and favorites are preserved. Use it after saving layout settings or feedback to see their effect without waiting through an older batch. The command-line equivalent is `artwall curate --count 3 --next`; ordinary scheduled curation continues to append to the queue.
 
@@ -63,42 +63,64 @@ Thumbs down on the current work immediately shows the next eligible cached compo
 
 Lowering the artwork limit filters previously queued compositions that exceed it immediately. Raising the limit allows more works in newly prepared layouts; it does not rearrange already rendered wallpapers. Save the setting, then choose **Prepare new wallpapers** to put fresh layouts next in rotation. Previously viewed compositions remain in history.
 
+The interval, model, and artwork limit you save in the gallery are stored in the database and take precedence over the same keys in `config.toml`, which artwall never rewrites. `artwall status` lists any saved values.
+
 With **Up to two** or **Up to three**, a work that already fits the display stays alone. A narrow selection is compared with related pairs and, when allowed, trios at the actual display proportions. The coverage check prefers balanced groups with compatible colors and tonal contrast. Whole works share aligned edges, a common height, and a small consistent gap. If a suitable grouping is unavailable, the intact original keeps its diffuse surround; an enlarged detail is only used when explicitly chosen by the curator. Existing cached PNGs retain their prepared layouts; `artwall curate` prepares wallpapers with the current layout rules, while `artwall render --output FILE` previews the current decision with the updated renderer.
 
 Wallpaper captions wrap titles, metadata, companion labels, and the prepared description without cutting them off at a fixed number of lines. Line spacing follows the measured font size. If a complete caption is too tall, the renderer tries a wider column and then smaller type, keeping the text and its shadow inside the display margins. Full museum titles and catalog details remain available in the gallery and `artwall info`.
 
 ## Scheduling
 
-After the first wallpaper works in the Niri session:
+After the first wallpaper works in your desktop session:
 
 ```bash
 artwall install-timers
 ```
 
-This writes five `systemd --user` units under `~/.config/systemd/user/` and enables a login service plus the rotation and daily curation timers. The login service advances one cached wallpaper when the time since the last successful wallpaper change exceeds the configured interval. Rotation then shows another every two hours by default. Daily curation refreshes ArtIC metadata and renders the next queue. The interface updates an installed rotation timer when you change the interval. If you edit `[rotation].interval_minutes` by hand, run `artwall install-timers` again. `artwall install-timers --no-enable` writes the units without enabling them.
+This writes five `systemd --user` units under `~/.config/systemd/user/` and enables a login service plus the rotation and daily curation timers. The login service advances one cached wallpaper when the time since the last successful wallpaper change exceeds the configured interval. Rotation then shows another every two hours by default. Daily curation refreshes ArtIC metadata and renders the next queue. The gallery updates an installed rotation timer when you change the interval there. If you edit `[rotation].interval_minutes` in `config.toml` instead, run `artwall install-timers` again (a value saved in the gallery still wins). `artwall install-timers --no-enable` writes the units without enabling them.
 
 The rotation timer starts with the graphical session and does not catch up missed intervals while the computer is off. At login, Artwall keeps the current wallpaper if it changed within the interval; after a longer gap it advances once. Each later timer run also advances once. A failed desktop update leaves that work queued for the next attempt. The login service retries briefly if the wallpaper backend is still starting. Run `artwall next --if-due` to apply the same check manually.
 
+The timers rely on your session starting `graphical-session.target` and exporting `WAYLAND_DISPLAY` or `DISPLAY` to the systemd user manager. GNOME, Plasma, and sessions launched through uwsm do this. For a compositor or window manager started another way, add `systemctl --user import-environment WAYLAND_DISPLAY DISPLAY && systemctl --user start graphical-session.target` to its autostart, or run `artwall next --if-due` from autostart and `artwall next` from cron.
+
 ## Configuration
 
-`artwall init` writes `~/.config/artwall/config.toml` from [config.example.toml](artwall/config.example.toml). Defaults target 3440 × 1440, but width and height are configurable. Values must use their TOML types (for example `true`, not `"true"`); a mistyped value is refused rather than guessed. Notable options:
+`artwall init` writes `~/.config/artwall/config.toml` from [config.example.toml](artwall/config.example.toml). `init` fills `[display]` with the detected size of the focused or primary monitor (or `[wallpaper].output`); if detection fails it uses 1920 × 1080 and you should edit it. One size is rendered for all monitors; desktops scale it to other displays. Values must use their TOML types (for example `true`, not `"true"`); a mistyped value is refused rather than guessed. Notable options:
 
-- `[wallpaper].backend`: `auto`, `dms`, `awww`, or `swww`.
-- `[lockscreen].backend`: `auto`, `dms`, `hyprlock`, or `none` for a separate lock image.
+- `[wallpaper].backend` and `output`: see [Desktop support](#desktop-support).
+- `[lockscreen].backend`: `auto`, `dms`, `hyprlock`, `swaylock`, `kde`, or `none`.
 - `[lockscreen].public_lock_screen_safe`: conservative metadata keyword filtering when `true`. This is a best-effort filter, not image classification.
-- `[llm].enabled`, `model`, and `base_url`: local Ollama vision curation. No cloud API key is used.
+- `[llm].provider`, `model`, and `base_url`: `ollama` (default) or `openai` for any OpenAI-compatible `/chat/completions` API: llama.cpp, vLLM, LM Studio, OpenRouter, or OpenAI itself. For `openai`, `base_url` includes `/v1`. A key, when the server needs one, comes from the environment variable named by `api_key_env` (default `OPENAI_API_KEY`) or from `api_key_file`; it is never written to config.toml. The timers do not see your shell's environment, so prefer `api_key_file` (mode 600) for scheduled curation. A hosted API receives the contact sheet of public-domain thumbnails, museum metadata, and your written feedback; rotation still never calls it. The model must accept images.
 - `[curation].max_artworks`: `1` by default; raise to `2` or `3` to allow paired works again.
 - `[curation].explore_fraction` and `wildcard_fraction`: retain discovery alongside learned favorites.
 
-When using `awww` or `swww`, start its daemon in your Niri session. On this machine, DMS is already the active wallpaper and lock-screen layer, so `auto` selects it. The DMS backend passes an immutable composition path on every rotation to avoid stale wallpaper caching.
+## Desktop support
 
-With Hyprlock, artwall configures its background to reference `~/.cache/artwall/current.png` once and leaves other lock-screen settings intact. If the Hyprlock configuration only includes sourced files, set its background path manually to the current image or use a direct background block; artwall does not guess which included file to rewrite.
+With `backend = "auto"`, artwall uses the running desktop's own setter when `XDG_CURRENT_DESKTOP` names one, otherwise the first installed standalone tool.
+
+| Backend | Desktop | Command used | `output` |
+| --- | --- | --- | --- |
+| `gnome` | GNOME, Budgie, Unity | `gsettings` (light and dark picture) | ignored |
+| `kde` | KDE Plasma 5.24+ | `plasma-apply-wallpaperimage` | ignored |
+| `xfce` | Xfce | `xfconf-query` on each existing backdrop | monitor name |
+| `cinnamon` | Cinnamon | `gsettings` | ignored |
+| `mate` | MATE | `gsettings` | ignored |
+| `sway` | Sway | `swaymsg output … bg` | output name |
+| `dms` | DankMaterialShell (Niri, Hyprland, …) | `dms ipc` | output name |
+| `awww`, `swww` | Any wlroots compositor, Niri, Hyprland | `awww img` / `swww img` (daemon must be running) | output name |
+| `feh` | X11 window managers (i3, bspwm, Openbox, …) | `feh --bg-fill`; restore at login with `~/.fehbg` | ignored |
+
+Auto order outside those desktops is `dms`, `awww`, `swww`, then `feh` in an X11 session. `artwall status` shows which backend `auto` resolves to. Every backend receives the immutable composition path, so desktops that cache by filename notice each rotation.
+
+Lock screens: GNOME and Cinnamon lock screens already follow the wallpaper, so they need nothing. `auto` selects `kde` on Plasma (via `kwriteconfig6`/`kwriteconfig5`), else `dms`, `hyprlock`, or `swaylock` if installed, else `none`. Hyprlock and swaylock are configured once to read `~/.cache/artwall/current.png` and pick up each rotation the next time they start; other settings are left intact. If the Hyprlock configuration only includes sourced files, set its background path manually; artwall does not guess which included file to rewrite.
+
+Another tool is a small class in `artwall/desktop/wallpaper.py` or `lockscreen.py` that receives the rendered path.
 
 ## How it works
 
 1. **Retrieve:** ArtIC's API supplies public-domain artworks with source URLs and rights metadata. SQLite caches API responses and normalized records.
 2. **Filter and rank:** Recent works and blacklisted items are excluded; taste seeds, explicit artist feedback, novelty, resolution, and a configurable mix of exploration select a candidate pool.
-3. **Curate:** Ollama receives a labeled contact sheet of cached thumbnails, museum metadata, a short composition rubric, and recent written feedback. This request uses a 16,384-token context window so the rules, image, and up to 24 candidates are never silently truncated. It returns a constrained JSON decision. With the default limit it selects one work. Local geometry checks compare intact single, paired, and grouped works for useful display coverage. If the selection changes, a second local vision pass describes the final works. Local validation checks IDs, crop bounds, layout counts, and unsupported historical claims. A metadata-based fallback works without the model.
+3. **Curate:** The model receives a labeled contact sheet of cached thumbnails, museum metadata, a short composition rubric, and recent written feedback. With Ollama the request uses a 16,384-token context window so the rules, image, and up to 24 candidates are never silently truncated. It returns a constrained JSON decision. With the default limit it selects one work. Local geometry checks compare intact single, paired, and grouped works for useful display coverage. If the selection changes, a second local vision pass describes the final works. Local validation checks IDs, crop bounds, layout counts, and unsupported historical claims. A metadata-based fallback works without the model.
 4. **Render:** Pillow renders a wide work full bleed with only a very mild crop. Other proportions remain whole against a low-contrast, heavily blurred backdrop derived from the artwork. Only the backdrop is blurred and subdued; a thin edge and soft shadow separate the original from its surround. Pairs and trios keep their original proportions and paper margins at a shared height. Captions go in a side or lower surround if they fit; otherwise placement evaluates four image corners and adds a localized gradient when needed. Same-work detail templates remain available when the artwork limit is raised and the curator chooses a meaningful detail.
 5. **Queue and show:** PNGs and decisions are stored before display. `next` sets a cached image through the wallpaper adapter, updates the lock screen, and records history and feedback in SQLite.
 
@@ -114,15 +136,22 @@ This is the first vertical slice. ArtIC is the only museum adapter. Crop safety 
 
 ## Development
 
-The default tests are end-to-end scenarios that drive the CLI and gallery server in a temporary home. They cover rights and lock-screen filtering, blacklists, dislike navigation, database upgrades opened by several processes at once, and a failed wallpaper update followed by a later login. Hypothesis generates settings cases for the gallery API. Fake `dms` and `systemctl` commands stand in for the desktop; the default check needs no network, model, or graphical session. Install the test extra (`python -m pip install -e '.[test]'`) before running:
+The default tests are end-to-end scenarios that drive the CLI and gallery server in a temporary home. They cover rights and lock-screen filtering, blacklists, dislike navigation, database upgrades opened by several processes at once, and a failed wallpaper update followed by a later login. Hypothesis generates settings cases for the gallery API. Fake desktop commands stand in for the desktop (including GNOME, Plasma, and Xfce setters); the default check needs no network, model, or graphical session. The check also runs strict mypy over the package (configured in `pyproject.toml`); layouts are a typed `Whole | Row | Detail` union matched exhaustively, while models and storage keep the flat JSON form. Set up a virtual environment with the test extra, then run the check:
 
 ```bash
+python3 -m venv .venv && . .venv/bin/activate
+python -m pip install -e '.[test]'
 bash scripts/check
 ```
 
-To check curation against a running local Ollama and installed vision model, run `bash scripts/check-model`. It uses `qwen3.6:27b` by default; set `ARTWALL_TEST_MODEL` or `ARTWALL_TEST_OLLAMA_URL` for another local setup. This live check is separate from CI.
+Model output is fuzzed with Hypothesis (`tests/test_model_output.py`): arbitrary JSON and mutated decisions must yield a validated decision from the candidate pool or a fallback, never an exception.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and module ownership.
-`AGENTS.md` gives coding agents the same project contracts and check command.
+To check curation against a running vision model, run `bash scripts/check-model`. It uses Ollama with `qwen3.6:27b` by default; set `ARTWALL_TEST_MODEL` and `ARTWALL_TEST_MODEL_URL`, plus `ARTWALL_TEST_PROVIDER=openai` for an OpenAI-compatible server.
 
-The project is MIT licensed. Museum images retain their own rights metadata and source URL; only ArtIC records explicitly marked public domain are admitted by the current adapter. See [ArtIC API and IIIF documentation](https://api.artic.edu/docs/) for their current usage guidance.
+`bash scripts/check-desktops` builds a Fedora container with the real GNOME, Cinnamon, MATE, Xfce, Plasma lock-screen, Sway, and X11 (`feh`, `xrandr`) tools, starts headless Sway and Xvfb, and checks each backend by reading the setting back with the desktop's own tool. It needs podman (or `CONTAINER=docker`) and network access for the first build. Applying a Plasma wallpaper needs a running plasmashell and is not covered; nor are DMS, swww, or full desktop sessions.
+
+These live checks are separate from CI.
+
+`AGENTS.md` describes the module layout and the contracts changes should preserve.
+
+The code is MIT licensed: use it for anything. Museum images retain their own rights metadata and source URL; only ArtIC records explicitly marked public domain are admitted by the current adapter. See [ArtIC API and IIIF documentation](https://api.artic.edu/docs/) for their current usage guidance.

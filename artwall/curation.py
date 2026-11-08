@@ -17,12 +17,12 @@ import math
 from pathlib import Path
 import re
 from typing import Any, Collection, Iterable, Mapping, Sequence
-from urllib import request
+from urllib import error, request
 
 from PIL import Image, ImageDraw, ImageOps, ImageStat
 
-from artwall.models import (ANCHORS, LAYOUT_COUNTS, Artwork, CuratorDecision, DecisionArtwork, DecisionError, Layout,
-                            ratio_fit)
+from artwall.models import (ANCHORS, LAYOUT_COUNTS, Arrangement, Artwork, CuratorDecision, DecisionArtwork, Detail,
+                            DecisionError, Row, Whole, ratio_fit)
 
 
 LOG = logging.getLogger(__name__)
@@ -118,10 +118,6 @@ def _ratio(work: Artwork) -> float:
     return work.aspect_ratio or 1.0
 
 
-def _single_layout(work: Artwork) -> Layout:
-    return "single" if _ratio(work) >= 1.85 else "near_single"
-
-
 def lock_screen_safe(artwork: Artwork) -> bool:
     """Conservative metadata keyword check for a public lock screen."""
     text = " ".join((artwork.title, _tags(artwork), artwork.museum_description or "", artwork.medium or ""))
@@ -155,8 +151,9 @@ def validate_decision(raw: Mapping[str, object] | CuratorDecision, candidates: S
             raise DecisionError(f"Unknown artwork ID: {entry.id}")
         if entry.crop and min(entry.crop.width, entry.crop.height) < 0.65:
             raise DecisionError("Artwork crop removes too much of the original")
-    if decision.detail_crop and min(decision.detail_crop.width, decision.detail_crop.height) < 0.08:
-        raise DecisionError("Detail crop is too small")
+    match decision.arrangement:
+        case Detail(region=region) if region and min(region.width, region.height) < 0.08:
+            raise DecisionError("Detail crop is too small")
     description = _clean_text(decision.description, 500)
     if len(description.split()) > 50:
         raise DescriptionGroundingError("Description exceeds 50 words")
@@ -491,19 +488,15 @@ def deterministic_decision(candidates: Sequence[Artwork], taste: Taste = Taste()
         if strength >= 3:
             related.append((strength, work, rationale))
     related.sort(key=lambda item: (-item[0], -score_candidate(item[1]), item[1].id))
-    layout = _single_layout(first)
     selected = [first]
     if (len(related) >= 2
             and related[0][2] == related[1][2]
             and all(_ratio(work) <= 1.15 for work in (first, related[0][1], related[1][1]))):
         selected += [related[0][1], related[1][1]]
-        layout = "triptych"
     elif related and _ratio(first) < 1.65 and _ratio(related[0][1]) < 1.65:
         selected.append(related[0][1])
-        layout = "diptych"
     decision = CuratorDecision(
-        layout=layout, primary_artwork_id=first.id,
-        artworks=tuple(DecisionArtwork(work.id) for work in selected),
+        _whole_works([DecisionArtwork(work.id) for work in selected]),
         description=source_description(first) if len(selected) == 1 else "",
         curator_reason="Deterministic selection from public-domain works, taste seeds, and recent history.",
     )
@@ -511,8 +504,11 @@ def deterministic_decision(candidates: Sequence[Artwork], taste: Taste = Taste()
 
 
 def _parse_model_json(content: str) -> Any:
-    # Some local vision models wrap JSON in a Markdown fence even in JSON mode.
+    # Some vision models wrap JSON in a Markdown fence even in JSON mode, and
+    # reasoning models served over OpenAI-compatible APIs may prefix their thinking.
     content = content.strip()
+    if content.startswith("<think>") and "</think>" in content:
+        content = content.split("</think>", 1)[1].strip()
     if content.startswith("```json") and content.endswith("```"):
         content = content[7:-3].strip()
     elif content.startswith("```") and content.endswith("```"):
@@ -599,19 +595,38 @@ def _feedback_json(feedback: Iterable[Mapping[str, object]]) -> str:
     return _compact_json(notes)
 
 
-class OllamaCurator:
-    """Curate with an installed local vision model; fall back without network."""
+def _post_json(url: str, payload: Mapping[str, Any], *, timeout: float, api_key: str | None = None) -> Any:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+    with request.urlopen(req, timeout=timeout) as response:
+        return json.load(response)
+
+
+class ModelCurator:
+    """Curate with a vision model over Ollama or an OpenAI-compatible API.
+
+    Every answer is untrusted and validated locally; any failure falls back to
+    metadata-based curation.
+    """
 
     def __init__(self, model: str = "qwen3.6:27b", base_url: str = "http://127.0.0.1:11434",
-                 timeout: int = 300, description_words: int = 40) -> None:
+                 timeout: int = 300, description_words: int = 40, *,
+                 provider: str = "ollama", api_key: str | None = None) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.description_words = max(20, min(50, int(description_words)))
+        self.provider = provider
+        self.api_key = api_key
 
     def _chat(self, prompt: str, *, image: bytes | None = None, temperature: float = 0,
               num_predict: int = 180, num_ctx: int = 8192, timeout: float | None = None) -> Any:
-        """Send one local Ollama chat request and parse its JSON answer."""
+        """Send one chat request and parse its JSON answer."""
+        timeout = timeout or self.timeout
+        if self.provider == "openai":
+            return _parse_model_json(self._openai_chat(prompt, image, temperature, num_predict, timeout))
         message: dict[str, Any] = {"role": "user", "content": prompt}
         if image is not None:
             message["images"] = [base64.b64encode(image).decode("ascii")]
@@ -624,13 +639,34 @@ class OllamaCurator:
             "format": "json", "stream": False, "think": False,
             "options": {"temperature": temperature, "num_predict": num_predict, "num_ctx": num_ctx},
         }
-        req = request.Request(
-            self.base_url + "/api/chat", data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
-        with request.urlopen(req, timeout=timeout or self.timeout) as response:
-            outer = json.load(response)
+        outer = _post_json(self.base_url + "/api/chat", payload, timeout=timeout)
         return _parse_model_json(outer["message"]["content"])
+
+    def _openai_chat(self, prompt: str, image: bytes | None, temperature: float,
+                     max_tokens: int, timeout: float) -> str:
+        """POST /chat/completions (OpenAI, OpenRouter, llama.cpp, vLLM, LM Studio, ...)."""
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        if image is not None:
+            encoded = base64.b64encode(image).decode("ascii")
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}})
+        minimal = {"model": self.model, "messages": [{"role": "user", "content": content}]}
+        payload = {**minimal, "temperature": temperature, "max_tokens": max_tokens,
+                   "response_format": {"type": "json_object"}}
+        url = self.base_url + "/chat/completions"
+        try:
+            outer = _post_json(url, payload, timeout=timeout, api_key=self.api_key)
+        except error.HTTPError as exc:
+            # Servers differ on JSON mode, max_tokens, and temperature. The prompt
+            # already asks for JSON, so retry once with only the required fields.
+            exc.close()
+            if exc.code != 400:
+                raise
+            outer = _post_json(url, minimal, timeout=timeout, api_key=self.api_key)
+        choices = outer.get("choices") or [{}]
+        answer = (choices[0].get("message") or {}).get("content")
+        if not isinstance(answer, str):
+            raise DecisionError("Model returned no text content")
+        return answer
 
     def _description(self, prompt: str, **options: Any) -> str:
         value = self._chat(prompt, **options)
@@ -668,7 +704,7 @@ class OllamaCurator:
             _validate_description(repaired, works, by_id[draft.primary_artwork_id])
             return repaired
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            LOG.warning("ollama_curator_caption_repair_failed reason=%s", exc)
+            LOG.warning("model_curator_caption_repair_failed reason=%s", exc)
             return ""
 
     def describe_final(self, decision: CuratorDecision, candidates: Sequence[Artwork]) -> CuratorDecision:
@@ -711,16 +747,14 @@ class OllamaCurator:
             )
             return validate_decision(replace(fallback, description=description), works)
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            LOG.warning("ollama_final_caption_failed reason=%s", exc)
+            LOG.warning("model_final_caption_failed reason=%s", exc)
             return fallback
 
     def _selection_prompt(self, ranked: Sequence[Artwork], taste: Taste, max_artworks: int,
                           screen_ratio: float, feedback: Sequence[Mapping[str, object]]) -> str:
         """The first, visual curation request: choose works and a layout."""
-        example = CuratorDecision(
-            layout="single", primary_artwork_id=ranked[0].id, artworks=(DecisionArtwork(ranked[0].id),),
-            curator_reason="visual and compositional reason for the choice",
-        )
+        example = CuratorDecision(Whole(DecisionArtwork(ranked[0].id)),
+                                  curator_reason="visual and compositional reason for the choice")
         layouts = {layout: count for layout, count in LAYOUT_COUNTS.items()
                    if count <= max_artworks and (max_artworks > 1 or layout != "artwork_detail")}
         selection = "exactly one work" if max_artworks == 1 else f"1-{max_artworks} works"
@@ -731,7 +765,7 @@ class OllamaCurator:
             f"Select {selection}, preserve its composition when selecting one, and prefer related works "
             "when combining several.",
             _SELECTION_RULES,
-            "Choose only single or near_single layout; do not choose artwork_detail." if max_artworks == 1 else "",
+            "Choose only the single layout; do not choose artwork_detail." if max_artworks == 1 else "",
             f"Aim for about {self.description_words} words of educational description, never more than 50, "
             "and only when supported by museum_description or supplied metadata.",
             _CAPTION_RULES,
@@ -770,7 +804,7 @@ class OllamaCurator:
                 # Keep a good visual selection while discarding only the
                 # unsupported caption. A short text-only rewrite can recover
                 # an educational observation without another image request.
-                LOG.warning("ollama_curator_caption_rejected reason=%s", exc)
+                LOG.warning("model_curator_caption_rejected reason=%s", exc)
                 # A primary-only draft lacks evidence about the companions.
                 # The final selected images need a second vision pass.
                 repaired = "" if len(draft.artworks) > 1 else self._repair_description(draft, ranked, str(exc))
@@ -786,33 +820,37 @@ class OllamaCurator:
                     decision,
                     curator_reason="Local model selected this visual composition; artwork facts and relationships come from museum metadata.",
                 )
-            LOG.info("ollama_curator_choice model=%s layout=%s artworks=%s",
+            LOG.info("model_curator_choice model=%s layout=%s artworks=%s",
                      self.model, decision.layout, decision.artwork_ids)
             return decision
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            LOG.warning("ollama_curator_fallback reason=%s", exc)
-            LOG.debug("ollama_curator_fallback_trace", exc_info=True)
+            LOG.warning("model_curator_fallback reason=%s", exc)
+            LOG.debug("model_curator_fallback_trace", exc_info=True)
             fallback = deterministic_decision(candidates, taste)
             return replace(fallback, curator_reason=(
                 f"Local model unavailable or invalid ({type(exc).__name__}); {fallback.curator_reason}"))
 
 
+def _whole_works(works: Sequence[DecisionArtwork]) -> Arrangement:
+    """One whole original, or a row of them with the first as primary."""
+    return Whole(works[0]) if len(works) == 1 else Row.of(works)
+
+
 def limit_artworks(decision: CuratorDecision, pool: Sequence[Artwork], limit: int) -> CuratorDecision:
     """Reduce a decision to the configured number of works."""
-    if len(decision.artworks) <= limit and not (limit == 1 and decision.layout == "artwork_detail"):
+    if len(decision.artworks) <= limit and not (limit == 1 and isinstance(decision.arrangement, Detail)):
         return decision
     primary = next(entry for entry in decision.artworks if entry.id == decision.primary_artwork_id)
     if limit == 2:
         companion = next(entry for entry in decision.artworks if entry.id != primary.id)
         try:
-            return validate_decision(replace(decision, layout="diptych", artworks=(primary, companion),
-                                             description="", detail_crop=None), pool)
+            return validate_decision(replace(decision, arrangement=Row((primary, companion)), description=""),
+                                     pool)
         except DecisionError:
             pass
     work = next(art for art in pool if art.id == primary.id)
     return validate_decision(replace(
-        decision, layout=_single_layout(work), artworks=(primary,), relationship="",
-        description=source_description(work), detail_crop=None,
+        decision, arrangement=Whole(primary), relationship="", description=source_description(work),
         curator_reason=decision.curator_reason + " Limited to one work by max_artworks setting.",
     ), pool)
 
@@ -847,7 +885,7 @@ def _color_signature(work: Artwork) -> tuple[float, ...] | None:
 def ensure_coverage(decision: CuratorDecision, pool: Sequence[Artwork], *,
                     max_artworks: int, screen_ratio: float) -> CuratorDecision:
     """Compare intact, related groupings at the actual display proportions."""
-    if max_artworks == 1 or decision.layout == "artwork_detail":
+    if max_artworks == 1 or isinstance(decision.arrangement, Detail):
         return decision
     by_id = {work.id: work for work in pool}
     primary = by_id[decision.primary_artwork_id]
@@ -858,11 +896,9 @@ def ensure_coverage(decision: CuratorDecision, pool: Sequence[Artwork], *,
         return decision
 
     def revised(works: Sequence[Artwork]) -> CuratorDecision:
-        layout = (_single_layout(primary), "diptych", "triptych")[len(works) - 1]
         ids = [work.id for work in works]
         return validate_decision(replace(
-            decision, layout=layout, artworks=tuple(DecisionArtwork(i) for i in ids),
-            detail_crop=None, relationship="",
+            decision, arrangement=_whole_works([DecisionArtwork(i) for i in ids]), relationship="",
             description=decision.description if ids == decision.artwork_ids else (
                 source_description(primary) if len(works) == 1 else ""),
             curator_reason=decision.curator_reason + " Layout revised for intact artwork coverage and balance.",
@@ -911,7 +947,7 @@ def ensure_coverage(decision: CuratorDecision, pool: Sequence[Artwork], *,
 
 
 def choose_composition(pool: Sequence[Artwork], taste: Taste, *, max_artworks: int, screen_ratio: float,
-                       curator: OllamaCurator | None = None,
+                       curator: ModelCurator | None = None,
                        feedback: Sequence[Mapping[str, object]] = ()) -> CuratorDecision:
     """Select works, fit them to the artwork limit and screen, and describe the final set."""
     if curator is None:

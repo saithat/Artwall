@@ -11,7 +11,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageOps, ImageStat
 
 from artwall import cli
 from artwall.config import database_path
-from artwall.models import CuratorDecision, DecisionArtwork
+from artwall.models import CuratorDecision, DecisionArtwork, arrangement_from_layout
 from artwall.storage import Database
 from tests.support import HomeTest
 
@@ -51,6 +51,58 @@ class CliTests(HomeTest):
         for path in (image, self.root / "again.png"):
             with Image.open(path) as rendered:
                 self.assertEqual(rendered.size, (860, 360))
+
+    def test_auto_backends_follow_the_running_desktop_environment(self):
+        (self.bin_dir / "dms").unlink()  # A desktop environment's own setter, with no shell installed.
+        background = "org.gnome.desktop.background"
+        xfce_image = "/backdrop/screen0/monitorDP-1/workspace0/last-image"
+        desktops = {
+            "ubuntu:GNOME": ({"gsettings": "picture-uri\npicture-uri-dark\npicture-options\n"},
+                             lambda image: [f"gsettings list-keys {background}",
+                                            f"gsettings set {background} picture-uri {image.as_uri()}",
+                                            f"gsettings set {background} picture-uri-dark {image.as_uri()}"]),
+            "KDE": ({"plasma-apply-wallpaperimage": "", "kwriteconfig6": ""},
+                    lambda image: [f"plasma-apply-wallpaperimage {image}",
+                                   "kwriteconfig6 --file kscreenlockerrc --group Greeter --group Wallpaper "
+                                   f"--group org.kde.image --group General --key Image {image.as_uri()}"]),
+            "XFCE": ({"xfconf-query": f"{xfce_image}\n/backdrop/screen0/monitorDP-1/workspace0/image-style\n"},
+                     lambda image: ["xfconf-query -c xfce4-desktop -l",
+                                    f"xfconf-query -c xfce4-desktop -p {xfce_image} -s {image}"]),
+        }
+        with self.database() as db:
+            for name in desktops:
+                self.queue(db, name.lower(), self.artwork(name, (1600, 1200)))
+        for desktop, (commands, expected) in desktops.items():
+            with self.subTest(desktop=desktop), patch.dict("os.environ", {"XDG_CURRENT_DESKTOP": desktop}):
+                for command, output in commands.items():
+                    self.fake_command(command, output)
+                self.commands_log.unlink(missing_ok=True)
+                self.cli("next")
+                with self.database() as db:
+                    image = Path(db.get_current().output_path).resolve()
+                self.assertEqual(self.commands(), expected(image))
+                for command in commands:
+                    (self.bin_dir / command).unlink()
+
+    def test_init_detects_the_display_size(self):
+        niri = {"DP-1": {"current_mode": 1, "modes": [{"width": 1920, "height": 1080},
+                                                      {"width": 3440, "height": 1440}]}}
+        hyprland = [{"name": "HDMI-A-1", "width": 3840, "height": 2160, "focused": False},
+                    {"name": "eDP-1", "width": 2560, "height": 1600, "focused": True}]
+        xrandr = ("Screen 0: minimum 8 x 8, current 4480 x 1440\n"
+                  "HDMI-1 connected 2560x1440+1920+0 (normal) 597mm x 336mm\n"
+                  "DP-2 connected primary 1920x1080+0+0 (normal) 527mm x 296mm\nDP-3 disconnected\n")
+        cases = (("niri", json.dumps(niri), (3440, 1440)), ("hyprctl", json.dumps(hyprland), (2560, 1600)),
+                 ("xrandr", xrandr, (1920, 1080)))
+        for command, output, (width, height) in cases:
+            with self.subTest(command=command):
+                self.config_file.unlink()
+                self.fake_command(command, output)
+                self.assertIn(f"Display: {width} × {height} (detected)", self.cli("init"))
+                self.assertIn(f"Display: {width} × {height}\nBackend: auto (dms)", self.cli("status"))
+                (self.bin_dir / command).unlink()
+        self.config_file.unlink()
+        self.assertIn("Display: 1920 × 1080 (not detected", self.cli("init"))
 
     def test_content_filters_apply_to_curation_and_prepared_wallpapers(self):
         self.configure("[lockscreen]\npublic_lock_screen_safe = true\n")
@@ -111,11 +163,11 @@ class CliTests(HomeTest):
 
     def test_curator_fits_related_whole_works_without_arbitrary_details(self):
         cases = (
-            ("pair", 2, ((1600, 1450), (1600, 1450)), "near_single", 2),
-            ("trio", 3, ((1500, 2000),) * 3, "near_single", 3),
+            ("pair", 2, ((1600, 1450), (1600, 1450)), "single", 2),
+            ("trio", 3, ((1500, 2000),) * 3, "single", 3),
             ("wide", 3, ((3200, 1400), (1600, 1450)), "single", 1),
             ("overfull", 2, ((3200, 1400),) * 2, "diptych", 1),
-            ("unrelated", 3, ((1600, 1450),), "near_single", 1),
+            ("unrelated", 3, ((1600, 1450),), "single", 1),
         )
         for name, limit, sizes, layout, expected in cases:
             with self.subTest(name=name):
@@ -125,11 +177,10 @@ class CliTests(HomeTest):
                 with self.database() as db:
                     for work in works:
                         db.upsert_artwork(work)
-                draft = CuratorDecision(layout, works[0].id,
-                                        tuple(DecisionArtwork(w.id) for w in works[:2 if layout == "diptych" else 1]),
-                                        use_gradient=False)
-                with patch("artwall.curation.OllamaCurator._chat", return_value=draft.to_dict()), \
-                     patch("artwall.curation.OllamaCurator.describe_final", side_effect=lambda decision, pool: decision):
+                chosen = [DecisionArtwork(w.id) for w in works[:2 if layout == "diptych" else 1]]
+                draft = CuratorDecision(arrangement_from_layout(layout, works[0].id, chosen), use_gradient=False)
+                with patch("artwall.curation.ModelCurator._chat", return_value=draft.to_dict()), \
+                     patch("artwall.curation.ModelCurator.describe_final", side_effect=lambda decision, pool: decision):
                     self.cli("curate", "--count", "1")
                 with self.database() as db:
                     composition = next(c for c in db.list_compositions() if c.decision.primary_artwork_id == works[0].id)
@@ -287,8 +338,10 @@ class CliTests(HomeTest):
         self.configure("[curation]\nmax_artworks = 2\n")
         with self.database() as db:
             self.queue(db, "legacy", self.artwork("1"), self.artwork("2"))
-            # Earlier releases stored pairs as diptych_50 or diptych_60.
+            self.queue(db, "legacy-single", self.artwork("3"))
+            # Earlier releases stored pairs as diptych_50 or diptych_60, and narrow works as near_single.
             db.connection.execute("UPDATE compositions SET payload=replace(payload, '\"diptych\"', '\"diptych_60\"')")
+            db.connection.execute("UPDATE compositions SET payload=replace(payload, '\"single\"', '\"near_single\"')")
             db.connection.execute("DROP INDEX idx_compositions_queue")
             db.connection.execute("ALTER TABLE compositions DROP COLUMN queue_priority")
             db.connection.execute("PRAGMA user_version = 2")
@@ -313,10 +366,12 @@ class CliTests(HomeTest):
         with self.database() as db:
             db.connection.execute("PRAGMA user_version = 2")
             db.connection.commit()
-        self.assertIn("Queued: 1", self.cli("status"))
-        self.cli("next", "--no-apply")
+        self.assertIn("Queued: 2", self.cli("status"))
+        for layout in ("diptych", "single"):
+            self.cli("next", "--no-apply")
+            with self.database() as db:
+                self.assertEqual(db.get_current().decision.layout, layout)
         with self.database() as db:
-            self.assertEqual(db.get_current().decision.layout, "diptych")
             self.assertEqual(db.connection.execute("PRAGMA user_version").fetchone()[0], 3)
 
     def test_low_resolution_works_are_downloaded_once(self):

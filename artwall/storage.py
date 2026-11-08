@@ -9,6 +9,7 @@ import sqlite3
 import time
 from typing import Any, Iterable, Literal, Mapping, NamedTuple, get_args
 
+from artwall.config import Settings, with_gallery_settings
 from artwall.models import Artwork, Composition
 
 
@@ -225,6 +226,22 @@ class Database:
     def set_state(self, key: str, value: str) -> None:
         with self.connection:
             self.connection.execute(_PUT_STATE, (key, value))
+
+    def gallery_settings(self) -> dict[str, object]:
+        """Values saved from the gallery, which take precedence over config.toml."""
+        saved = json.loads(self.get_state("gallery_settings") or "{}")
+        return saved if isinstance(saved, dict) else {}
+
+    def settings(self, configured: Settings) -> Settings:
+        """The configuration with gallery-saved values applied."""
+        return with_gallery_settings(configured, self.gallery_settings())
+
+    def save_gallery_settings(self, configured: Settings, values: Mapping[str, object]) -> Settings:
+        """Validate and save gallery values, returning the settings they produce."""
+        saved = {**self.gallery_settings(), **values}
+        settings = with_gallery_settings(configured, saved)
+        self.set_state("gallery_settings", json.dumps(saved, sort_keys=True))
+        return settings
 
     def get_current(self) -> Composition | None:
         identifier = self.get_state("current_composition_id")

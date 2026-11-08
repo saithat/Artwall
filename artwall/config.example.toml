@@ -1,16 +1,20 @@
-[display]
-width = 3440
-height = 1440
+[display] # Pixel size of the wallpaper; `artwall init` fills in the detected display.
+width = 1920
+height = 1080
 
 [rotation]
 interval_minutes = 120
 
 [wallpaper]
-backend = "auto" # On this Niri desktop, auto selects DMS; awww and swww are supported.
-# output = "DP-1"
+# auto picks the running desktop's own setter (gnome, kde, xfce, cinnamon, mate, sway),
+# else the first installed of dms, awww, swww, or feh (X11).
+backend = "auto"
+# output = "DP-1" # Limit to one monitor where the backend supports it.
 
 [lockscreen]
-backend = "auto" # DMS here; Hyprlock if installed elsewhere; "none" keeps a separate lock image.
+# auto: kde on Plasma, else dms, hyprlock, or swaylock if installed, else none
+# (GNOME and Cinnamon lock screens already follow the wallpaper).
+backend = "auto"
 public_lock_screen_safe = false
 
 [sources]
@@ -30,5 +34,10 @@ show_medium = false
 
 [llm]
 enabled = true
-model = "qwen3.6:27b" # Locally installed vision model in Ollama.
-base_url = "http://127.0.0.1:11434"
+provider = "ollama" # or "openai" for any OpenAI-compatible /chat/completions API.
+model = "qwen3.6:27b" # A vision model the endpoint serves.
+base_url = "http://127.0.0.1:11434" # For "openai", include /v1, e.g. "https://api.openai.com/v1".
+# The API key is read from this environment variable, or from api_key_file if set.
+# Local servers such as llama.cpp, vLLM, or LM Studio usually need no key.
+api_key_env = "OPENAI_API_KEY"
+# api_key_file = "~/.config/artwall/api_key"

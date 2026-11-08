@@ -5,17 +5,22 @@ build-backend = "hatchling.build"
 [project]
 name = "artwall"
 version = "0.1.0"
-description = "A local museum curator for Niri and other Wayland desktops"
+description = "Museum-art wallpapers for Linux desktops, curated by a local vision model"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 dependencies = ["Pillow>=11.0"]
 
 [project.optional-dependencies]
-test = ["hypothesis>=6.0,<7"]
+test = ["hypothesis>=6.0,<7", "mypy>=1.10"]
 
 [project.scripts]
 artwall = "artwall.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["artwall"]
+
+[tool.mypy]
+files = ["artwall"]
+strict = true
+python_version = "3.11"

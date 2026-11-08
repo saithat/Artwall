@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-import json
+from dataclasses import dataclass, replace
 import math
 import os
 from pathlib import Path
-import re
 import tempfile
 import tomllib
 from typing import Any, Mapping
@@ -53,8 +51,8 @@ def write_atomic(path: Path, text: str) -> None:
 
 @dataclass(frozen=True)
 class Settings:
-    width: int = 3440
-    height: int = 1440
+    width: int = 1920
+    height: int = 1080
     interval_minutes: int = 120
     wallpaper_backend: str = "auto"
     wallpaper_output: str | None = None
@@ -63,7 +61,10 @@ class Settings:
     public_domain_only: bool = True
     source_artic: bool = True
     model: str = "qwen3.6:27b"
-    ollama_url: str = "http://127.0.0.1:11434"
+    model_provider: str = "ollama"
+    model_url: str = "http://127.0.0.1:11434"
+    api_key_env: str = "OPENAI_API_KEY"
+    api_key_file: str | None = None
     use_local_model: bool = True
     curation_batch_size: int = 14
     candidate_pool_size: int = 30
@@ -90,6 +91,7 @@ class Settings:
             (20 <= self.caption_words <= 50, "description_words must be from 20 to 50"),
             (not self.use_local_model or bool(self.model.strip()),
              "An enabled local model needs a nonempty model name"),
+            (self.model_provider in {"ollama", "openai"}, 'llm.provider must be "ollama" or "openai"'),
             (0 <= self.explore_fraction and 0 <= self.wildcard_fraction
              and self.explore_fraction + self.wildcard_fraction < 1,
              "Exploration fractions must be non-negative and sum to less than 1"),
@@ -99,8 +101,7 @@ class Settings:
                 raise ValueError(message)
 
 
-# Each Settings field's TOML table, key, and type. Unknown keys are refused when
-# editing, instead of writing a value that appears to change behavior but is ignored.
+# Each Settings field's TOML table, key, and type.
 _OPTIONS: dict[str, tuple[str, str, type]] = {
     "width": ("display", "width", int),
     "height": ("display", "height", int),
@@ -121,9 +122,21 @@ _OPTIONS: dict[str, tuple[str, str, type]] = {
     "show_medium": ("caption", "show_medium", bool),
     "use_local_model": ("llm", "enabled", bool),
     "model": ("llm", "model", str),
-    "ollama_url": ("llm", "base_url", str),
+    "model_provider": ("llm", "provider", str),
+    "model_url": ("llm", "base_url", str),
+    "api_key_env": ("llm", "api_key_env", str),
+    "api_key_file": ("llm", "api_key_file", str),
 }
-_KEY_TYPES = {(section, key): kind for section, key, kind in _OPTIONS.values()}
+
+
+def model_api_key(settings: Settings) -> str | None:
+    """The API key for an OpenAI-compatible endpoint, from a file or the environment.
+
+    The key itself is never stored in config.toml. Local servers need none.
+    """
+    if settings.api_key_file:
+        return Path(settings.api_key_file).expanduser().read_text(encoding="utf-8").strip() or None
+    return os.environ.get(settings.api_key_env) or None
 
 
 def _typed(value: object, kind: type, name: str) -> object:
@@ -156,90 +169,16 @@ def load_config(path: Path | None = None) -> Settings:
         return _settings(tomllib.load(handle))
 
 
-_TABLE = re.compile(r"^\s*\[([A-Za-z][A-Za-z0-9_-]*)\]\s*(?:#.*)?$")
-_ANY_TABLE = re.compile(r"^\s*\[{1,2}[^\]]+\]{1,2}\s*(?:#.*)?$")
-_KEY = re.compile(r"^(\s*[A-Za-z_][A-Za-z0-9_-]*\s*=\s*)(.*)$")
+# Settings the gallery edits. They are saved in the database and take
+# precedence over config.toml, which artwall never rewrites.
+GALLERY_SETTINGS: dict[str, type] = {"interval_minutes": int, "model": str, "max_artworks": int}
 
 
-def _toml_literal(value: object) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False)
-    return repr(value)
-
-
-def _comment_suffix(rhs: str) -> str:
-    """Keep an existing inline comment while ignoring # inside TOML strings."""
-    quote = ""
-    escaped = False
-    for index, char in enumerate(rhs):
-        if escaped:
-            escaped = False
-            continue
-        if char == "\\" and quote == '"':
-            escaped = True
-        elif quote:
-            if char == quote:
-                quote = ""
-        elif char in "\"'":
-            quote = char
-        elif char == "#":
-            start = index
-            while start and rhs[start - 1] in " \t":
-                start -= 1
-            return rhs[start:]
-    return ""
-
-
-def _replace_value(text: str, section: str, key: str, literal: str) -> str:
-    lines = text.splitlines(keepends=True)
-    begin = end = None
-    for index, line in enumerate(lines):
-        body = line.strip("\r\n")
-        match = _TABLE.match(body)
-        if _ANY_TABLE.match(body):
-            if begin is not None:
-                end = index
-                break
-            if match and match.group(1) == section:
-                begin = index
-    if begin is None:
-        separator = "" if not text or text.endswith("\n") else "\n"
-        blank = "" if not text else "\n"
-        return text + separator + blank + f"[{section}]\n{key} = {literal}\n"
-    if end is None:
-        end = len(lines)
-    for index in range(begin + 1, end):
-        body = lines[index].rstrip("\r\n")
-        match = _KEY.match(body)
-        if match and match.group(1).split("=", 1)[0].strip() == key:
-            newline = lines[index][len(body):]
-            lines[index] = match.group(1) + literal + _comment_suffix(match.group(2)) + newline
-            return "".join(lines)
-    lines.insert(end, f"{key} = {literal}\n")
-    return "".join(lines)
-
-
-def update_config_values(
-    updates: Mapping[str, Mapping[str, object]], path: Path | None = None
-) -> Settings:
-    """Atomically update selected TOML keys, preserving other lines and comments.
-
-    Validation happens before replacing the real file. A failed edit leaves the
-    previous configuration intact. The returned Settings reflect the new file.
-    """
-    path = path or config_path()
-    original = path.read_text(encoding="utf-8") if path.exists() else ""
-    contents = original
-    for section, keys in updates.items():
-        for key, value in keys.items():
-            kind = _KEY_TYPES.get((section, key))
-            if kind is None or kind is tuple:
-                raise ValueError(f"Unknown configuration key: {section}.{key}")
-            literal = _toml_literal(_typed(value, kind, f"{section}.{key}"))
-            contents = _replace_value(contents, section, key, literal)
-    settings = _settings(tomllib.loads(contents))
-    if contents != original:
-        write_atomic(path, contents)
-    return settings
+def with_gallery_settings(settings: Settings, saved: Mapping[str, object]) -> Settings:
+    """Apply gallery-saved values, checking their types; Settings validates their ranges."""
+    values: dict[str, Any] = {name: _typed(saved[name], kind, name)
+                               for name, kind in GALLERY_SETTINGS.items() if name in saved}
+    unknown = set(saved) - set(GALLERY_SETTINGS)
+    if unknown:
+        raise ValueError(f"Unknown gallery setting: {sorted(unknown)[0]}")
+    return replace(settings, **values)

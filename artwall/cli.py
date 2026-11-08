@@ -18,8 +18,11 @@ from uuid import uuid4
 import webbrowser
 
 from artwall import rotation
-from artwall.config import Settings, cache_dir, config_path, data_dir, database_path, load_config, write_atomic
-from artwall.curation import OllamaCurator, Taste, choose_composition, score_candidate
+from artwall.config import (
+    Settings, cache_dir, config_path, data_dir, database_path, load_config, model_api_key, write_atomic,
+)
+from artwall.curation import ModelCurator, Taste, choose_composition, score_candidate
+from artwall.desktop import detect_display_size, lock_screen_backend_name, wallpaper_backend_name
 from artwall.models import Artwork, Composition, CuratorDecision
 from artwall.render import RenderResult, RenderSettings, render_wallpaper
 from artwall.sources.artic import ArticSource
@@ -147,8 +150,15 @@ def _queue(db: Database, decision: CuratorDecision, settings: Settings, *, queue
 def cmd_init(_: argparse.Namespace, settings: Settings) -> None:
     path = config_path()
     if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(Path(__file__).resolve().parent / "config.example.toml", path)
+        template = (Path(__file__).resolve().parent / "config.example.toml").read_text(encoding="utf-8")
+        size = detect_display_size(settings.wallpaper_output)
+        if size:
+            template = template.replace("width = 1920\n", f"width = {size[0]}\n", 1)
+            template = template.replace("height = 1080\n", f"height = {size[1]}\n", 1)
+            print(f"Display: {size[0]} × {size[1]} (detected)")
+        else:
+            print(f"Display: {settings.width} × {settings.height} (not detected; edit [display] in the config)")
+        write_atomic(path, template)
     for directory in (data_dir(), cache_dir()):
         directory.mkdir(parents=True, exist_ok=True)
     with _database():
@@ -191,7 +201,8 @@ def cmd_curate(args: argparse.Namespace, settings: Settings) -> None:
     count = args.count or settings.curation_batch_size
     if not 1 <= count <= 30:
         raise ValueError("Count must be between 1 and 30")
-    curator = (OllamaCurator(settings.model, settings.ollama_url, description_words=settings.caption_words)
+    curator = (ModelCurator(settings.model, settings.model_url, description_words=settings.caption_words,
+                            provider=settings.model_provider, api_key=model_api_key(settings))
                if settings.use_local_model and not args.offline else None)
     created = 0
     started = time.time()
@@ -332,7 +343,15 @@ def cmd_status(args: argparse.Namespace, settings: Settings) -> None:
         print(f"Artworks: {db.count_artworks()}\nQueued: {sum(1 for _ in rotation.upcoming(db, settings))}\n"
               f"Current: {_label(db, current) if current else 'none'}")
     print(f"Database: {database_path()}\nWallpaper: {cache_dir() / 'current.png'}")
-    print(f"Backend: {settings.wallpaper_backend} · Lock screen: {settings.lockscreen_backend}")
+    with _database() as db:
+        saved = db.gallery_settings()
+    if saved:
+        print("Saved in the gallery (overrides config.toml): "
+              + ", ".join(f"{name} = {value}" for name, value in sorted(saved.items())))
+    wallpaper, locker = settings.wallpaper_backend, settings.lockscreen_backend
+    wallpaper = f"auto ({wallpaper_backend_name() or 'none found'})" if wallpaper == "auto" else wallpaper
+    locker = f"auto ({lock_screen_backend_name()})" if locker == "auto" else locker
+    print(f"Display: {settings.width} × {settings.height}\nBackend: {wallpaper} · Lock screen: {locker}")
 
 
 def cmd_render(args: argparse.Namespace, settings: Settings) -> None:
@@ -433,7 +452,11 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING,
                         format="%(levelname)s %(name)s: %(message)s")
     try:
-        args.handler(args, load_config())
+        settings = load_config()
+        if database_path().exists():
+            with _database() as db:
+                settings = db.settings(settings)
+        args.handler(args, settings)
         return 0
     except (OSError, RuntimeError, ValueError, KeyError) as exc:
         LOG.error("%s", exc)
