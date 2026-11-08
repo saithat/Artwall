@@ -76,6 +76,7 @@ class Preferences(Adw.PreferencesDialog):  # type: ignore[misc]
                                   expression=Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
         self.model_values: list[str] = []
         self.fetches = 0  # Only the latest model list is shown.
+        self.saved_model = (settings.model_provider, settings.agent, settings.model)
         self.key_file = Adw.EntryRow(title="API Key File (optional)", text=settings.api_key_file or "",
                                      show_apply_button=True)
         self.key_env = Adw.EntryRow(title="API Key Environment Variable", text=settings.api_key_env,
@@ -84,7 +85,7 @@ class Preferences(Adw.PreferencesDialog):  # type: ignore[misc]
             curator.add(row)
         self._show_models([], settings.model, loading=True)
         self.provider.connect("notify::selected", self._provider_changed)
-        self.agent.connect("notify::selected", lambda *_: self._fetch_models())
+        self.agent.connect("notify::selected", lambda *_: self._fetch_models(switched=True))
         for row in (self.endpoint, self.key_file, self.key_env):
             row.connect("apply", lambda *_: self._fetch_models())
         self._show_provider_rows()
@@ -94,7 +95,7 @@ class Preferences(Adw.PreferencesDialog):  # type: ignore[misc]
 
     def _provider_changed(self, *_: Any) -> None:
         self._show_provider_rows()
-        self._fetch_models()
+        self._fetch_models(switched=True)
 
     def _model_settings(self) -> dict[str, str]:
         return {"model_provider": _PROVIDERS[self.provider.get_selected()][0],
@@ -105,10 +106,18 @@ class Preferences(Adw.PreferencesDialog):  # type: ignore[misc]
         index = self.model.get_selected()
         return self.model_values[index] if 0 <= index < len(self.model_values) else ""
 
-    def _fetch_models(self) -> None:
-        """Ask the provider in the form, saved or not, which models it offers."""
+    def _fetch_models(self, *, switched: bool = False) -> None:
+        """Ask the provider in the form, saved or not, which models it offers.
+
+        A model belongs to its provider and agent: after switching either, the saved
+        model is offered only when they match what was saved; otherwise the choice resets.
+        """
         self.fetches += 1
         fetch, keep, changes = self.fetches, self._selected_model(), self._model_settings()
+        if switched:
+            provider, agent, model = self.saved_model
+            same = changes["model_provider"] == provider and (provider != "agent" or changes["agent"] == agent)
+            keep = model if same else ""
         self._show_models([], keep, loading=True)
         self.window.background.run(lambda: self.window.gallery.models(**changes),
                                    lambda names: self._fetched(fetch, names, keep),
@@ -128,7 +137,8 @@ class Preferences(Adw.PreferencesDialog):  # type: ignore[misc]
             values = [keep]
         keep = keep if keep in values else values[0]
         self.model_values = values
-        self.model.set_model(Gtk.StringList.new([value or "Default" for value in values]))
+        self.model.set_model(Gtk.StringList.new([value or ("Default" if agent else "No model listed")
+                                                 for value in values]))
         self.model.set_selected(values.index(keep) if keep in values else 0)
         if loading:
             subtitle = "Loading models…"
@@ -136,8 +146,10 @@ class Preferences(Adw.PreferencesDialog):  # type: ignore[misc]
             subtitle = "Default uses the agent's own choice."
         elif names:
             subtitle = f"{len(names)} model{'s' if len(names) != 1 else ''} at this endpoint. Choose one with vision support."
-        else:
+        elif keep:
             subtitle = "The endpoint did not list models; showing the saved model."
+        else:
+            subtitle = "The endpoint did not list models. Check it, then press ✓ to ask again."
         self.model.set_subtitle(subtitle)
 
     def _show_provider_rows(self) -> None:
