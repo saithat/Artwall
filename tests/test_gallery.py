@@ -225,6 +225,8 @@ class GalleryTests(HomeTest):
         self.assertEqual(self.gallery.models(model_provider="agent", agent="claude"), ["fable", "opus", "sonnet", "haiku"])
         self.assertEqual(self.gallery.models(model_provider="agent", agent="codex"), [])
         self.assertEqual(self.gallery.models(model_url="not a url"), [])
+        with self.assertRaisesRegex(ValueError, "not reachable at http://127.0.0.1:9"):
+            self.gallery.models(model_provider="ollama", model_url="http://127.0.0.1:9")
         # An agent may keep its own default model.
         self.gallery.save_settings(interval_minutes=120, model="", max_artworks=1, model_provider="agent")
         self.assertEqual(self.gallery.settings().model_provider, "agent")

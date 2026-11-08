@@ -308,7 +308,7 @@ class Gallery:
             return []  # For example an endpoint that is not a URL yet.
         if settings.model_provider == "agent":
             return list(_AGENT_MODELS.get(settings.agent, ()))
-        return available_models(settings)
+        return available_models(settings, strict=True)
 
     def thumbnail(self, record: Record, size: tuple[int, int] = (800, 400)) -> Path:
         """A cached JPEG preview of a composition for card grids."""
@@ -411,8 +411,12 @@ def _transcript(raw: object) -> tuple[tuple[str, str, str], ...]:
                  for entry in entries if isinstance(entry, dict))
 
 
-def available_models(settings: Settings) -> list[str]:
-    """Model names the configured endpoint offers, or [] when it cannot be asked quickly."""
+def available_models(settings: Settings, *, strict: bool = False) -> list[str]:
+    """Model names the configured endpoint offers, or [] when it cannot be asked quickly.
+
+    With ``strict``, an endpoint that cannot be reached raises ValueError saying so,
+    so the app can tell that apart from a server with no models.
+    """
     if settings.model_provider == "agent":
         return []  # Agent CLIs choose among their own models; leave the name free-form.
     base_url = settings.model_url.rstrip("/")
@@ -435,5 +439,10 @@ def available_models(settings: Settings) -> list[str]:
             value = json.load(response)
         return sorted({item[name] for item in value.get(key, [])
                        if isinstance(item, dict) and isinstance(item.get(name), str)})
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    except OSError as exc:
+        if strict:
+            server = "Ollama" if settings.model_provider == "ollama" else "The endpoint"
+            raise ValueError(f"{server} is not reachable at {base_url}") from exc
+        return []
+    except (ValueError, KeyError, TypeError, AttributeError):
         return []

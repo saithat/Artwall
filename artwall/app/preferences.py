@@ -121,13 +121,13 @@ class Preferences(Adw.PreferencesDialog):  # type: ignore[misc]
         self._show_models([], keep, loading=True)
         self.window.background.run(lambda: self.window.gallery.models(**changes),
                                    lambda names: self._fetched(fetch, names, keep),
-                                   lambda exc: self._fetched(fetch, [], keep))
+                                   lambda exc: self._fetched(fetch, [], keep, str(exc)))
 
-    def _fetched(self, fetch: int, names: list[str], keep: str) -> None:
+    def _fetched(self, fetch: int, names: list[str], keep: str, error: str = "") -> None:
         if fetch == self.fetches:
-            self._show_models(names, keep)
+            self._show_models(names, keep, error=error)
 
-    def _show_models(self, names: list[str], keep: str, *, loading: bool = False) -> None:
+    def _show_models(self, names: list[str], keep: str, *, loading: bool = False, error: str = "") -> None:
         agent = _PROVIDERS[self.provider.get_selected()][0] == "agent"
         values = ([""] if agent else []) + names  # "" is the agent's default model.
         if keep and keep not in values:
@@ -142,6 +142,9 @@ class Preferences(Adw.PreferencesDialog):  # type: ignore[misc]
         self.model.set_selected(values.index(keep) if keep in values else 0)
         if loading:
             subtitle = "Loading models…"
+        elif error:
+            start = " Start it (ollama serve)," if error.startswith("Ollama") else " Check it,"
+            subtitle = f"{error}.{start} then press ✓ beside the endpoint to ask again."
         elif agent:
             subtitle = "Default uses the agent's own choice."
         elif names:
