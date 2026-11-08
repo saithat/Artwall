@@ -73,6 +73,7 @@ class Settings:
     api_key_file: str | None = None
     agent: str = "claude"
     agent_command: tuple[str, ...] = ()
+    prompt_overrides: tuple[tuple[str, str], ...] = ()  # Saved from the app; see artwall.prompts.
     use_local_model: bool = True
     queue_size: int = 6  # Wallpapers kept prepared ahead of rotation.
     candidate_pool_size: int = 30
@@ -102,6 +103,8 @@ class Settings:
              "An enabled model needs a nonempty model name"),
             (self.model_provider in {"ollama", "openai", "agent"}, 'llm.provider must be "ollama", "openai", or "agent"'),
             (self.agent in {"claude", "codex", "command"}, 'llm.agent must be "claude", "codex", or "command"'),
+            (self.model_provider == "agent" or self.model_url.startswith(("http://", "https://")),
+             "The model endpoint must be an http:// or https:// URL"),
             (0 <= self.explore_fraction and 0 <= self.wildcard_fraction
              and self.explore_fraction + self.wildcard_fraction < 1,
              "Exploration fractions must be non-negative and sum to less than 1"),
@@ -186,19 +189,25 @@ def curation_fingerprint(settings: Settings) -> str:
     """The settings that shape a prepared wallpaper. When they change, upcoming ones are replaced."""
     shaping = (settings.width, settings.height, settings.max_artworks, settings.use_local_model,
                settings.model_provider, settings.model.strip(), settings.model_url, settings.agent,
-               list(settings.agent_command), settings.caption_on_wallpaper, settings.show_medium)
+               list(settings.agent_command), settings.caption_on_wallpaper, settings.show_medium,
+               [list(pair) for pair in settings.prompt_overrides])
     return hashlib.sha256(json.dumps(shaping).encode()).hexdigest()[:16]
 
 
 # Settings the gallery edits. They are saved in the database and take
 # precedence over config.toml, which artwall never rewrites.
-GALLERY_SETTINGS: dict[str, type] = {"interval_minutes": int, "model": str, "max_artworks": int}
+GALLERY_SETTINGS: dict[str, type] = {
+    "interval_minutes": int, "model": str, "max_artworks": int, "model_provider": str, "model_url": str,
+    "agent": str, "api_key_env": str, "api_key_file": str,
+}
 
 
 def with_gallery_settings(settings: Settings, saved: Mapping[str, object]) -> Settings:
     """Apply gallery-saved values, checking their types; Settings validates their ranges."""
     values: dict[str, Any] = {name: _typed(saved[name], kind, name)
                                for name, kind in GALLERY_SETTINGS.items() if name in saved}
+    if "api_key_file" in values:
+        values["api_key_file"] = values["api_key_file"].strip() or None  # Empty uses the environment variable.
     unknown = set(saved) - set(GALLERY_SETTINGS)
     if unknown:
         raise ValueError(f"Unknown gallery setting: {sorted(unknown)[0]}")

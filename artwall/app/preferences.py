@@ -1,4 +1,4 @@
-"""Curator settings and exclusions."""
+"""Curator settings, prompts, and exclusions."""
 
 from __future__ import annotations
 
@@ -11,22 +11,38 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gtk  # noqa: E402
 
 from artwall.gallery import State, Work  # noqa: E402
+from artwall.prompts import FIXED  # noqa: E402
 
 if TYPE_CHECKING:
     from artwall.app.window import ArtwallWindow
 
-_PROVIDERS = {"ollama": "Ollama", "openai": "An OpenAI-compatible API"}
+_PROVIDERS = (("ollama", "Ollama (local)"), ("openai", "OpenAI-Compatible API"), ("agent", "Agent CLI (subscription)"))
+_AGENTS = (("claude", "Claude Code"), ("codex", "Codex"), ("command", "Custom command (config.toml)"))
 _MATCHES = 6
+
+
+def _monospace_view(text: str, *, editable: bool) -> Any:
+    view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, monospace=True, editable=editable, cursor_visible=editable,
+                        top_margin=10, bottom_margin=10, left_margin=12, right_margin=12)
+    view.get_buffer().set_text(text)
+    return view
+
+
+def _text(view: Any) -> str:
+    buffer = view.get_buffer()
+    return str(buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False))
 
 
 class Preferences(Adw.PreferencesDialog):  # type: ignore[misc]
     def __init__(self, window: ArtwallWindow, state: State) -> None:
         super().__init__(search_enabled=False)
         self.window = window
-        self.saved = (state.settings.interval_minutes, state.settings.model, state.settings.max_artworks)
         self.add(self._curator_page(state))
+        self.prompts = Prompts(window)
+        self.add(self.prompts)
         self.exclusions = Exclusions(window, state)
         self.add(self.exclusions)
+        self.saved = self._values()
         self.connect("closed", lambda _dialog: self._save())
 
     def _curator_page(self, state: State) -> Any:
@@ -37,49 +53,156 @@ class Preferences(Adw.PreferencesDialog):  # type: ignore[misc]
         self.interval.set_title("Change Wallpaper Every")
         self.interval.set_subtitle("Minutes. Give each work enough time to be seen.")
         self.interval.set_value(settings.interval_minutes)
-        rotation.add(self.interval)
-        page.add(rotation)
-
-        if settings.model_provider == "agent":
-            source = (f"Your signed-in {settings.agent} agent. Leave the model empty for its default. "
-                      "The agent is chosen in config.toml.")
-        else:
-            provider = _PROVIDERS.get(settings.model_provider, settings.model_provider)
-            source = f"{provider} at {settings.model_url}. The endpoint and any API key are set in config.toml."
-        curator = Adw.PreferencesGroup(title="Curator Model", description=source)
-        self.model = Adw.EntryRow(title="Vision Model", text=settings.model)
-        self.models = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
-        popover = Gtk.Popover(child=Gtk.ScrolledWindow(child=self.models, max_content_height=320,
-                                                       propagate_natural_height=True))
-        choose = Gtk.MenuButton(icon_name="view-list-symbolic", popover=popover, valign=Gtk.Align.CENTER,
-                                tooltip_text="Models offered by the endpoint", sensitive=False,
-                                css_classes=["flat"])
-        self.model.add_suffix(choose)
-        self.window.background.run(self.window.gallery.models,
-                                   lambda names: self._offer(names, choose, popover), lambda exc: None)
         self.count = Adw.ComboRow(title="Works on One Wallpaper",
                                   subtitle="Related works can share the wall when they fit together well.",
                                   model=Gtk.StringList.new(["One", "Up to two", "Up to three"]))
         self.count.set_selected(settings.max_artworks - 1)
-        curator.add(self.model)
-        curator.add(self.count)
+        rotation.add(self.interval)
+        rotation.add(self.count)
+        page.add(rotation)
+
+        curator = Adw.PreferencesGroup(
+            title="Curator Model",
+            description="Changes here prepare upcoming wallpapers again. API keys are never stored by Artwall; "
+                        "it reads them from a file or an environment variable.")
+        self.provider = Adw.ComboRow(title="Provider", model=Gtk.StringList.new([name for _, name in _PROVIDERS]))
+        self.provider.set_selected(next((i for i, (key, _) in enumerate(_PROVIDERS)
+                                         if key == settings.model_provider), 0))
+        self.endpoint = Adw.EntryRow(title="Endpoint", text=settings.model_url, show_apply_button=True)
+        self.agent = Adw.ComboRow(title="Agent", subtitle="Uses the account the agent CLI is signed in with.",
+                                  model=Gtk.StringList.new([name for _, name in _AGENTS]))
+        self.agent.set_selected(next((i for i, (key, _) in enumerate(_AGENTS) if key == settings.agent), 0))
+        self.model = Adw.ComboRow(title="Vision Model", enable_search=True,
+                                  expression=Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
+        self.model_values: list[str] = []
+        self.fetches = 0  # Only the latest model list is shown.
+        self.key_file = Adw.EntryRow(title="API Key File (optional)", text=settings.api_key_file or "",
+                                     show_apply_button=True)
+        self.key_env = Adw.EntryRow(title="API Key Environment Variable", text=settings.api_key_env,
+                                    show_apply_button=True)
+        for row in (self.provider, self.endpoint, self.agent, self.model, self.key_file, self.key_env):
+            curator.add(row)
+        self._show_models([], settings.model, loading=True)
+        self.provider.connect("notify::selected", self._provider_changed)
+        self.agent.connect("notify::selected", lambda *_: self._fetch_models())
+        for row in (self.endpoint, self.key_file, self.key_env):
+            row.connect("apply", lambda *_: self._fetch_models())
+        self._show_provider_rows()
+        self._fetch_models()
         page.add(curator)
         return page
 
-    def _offer(self, names: list[str], button: Any, popover: Any) -> None:
-        for name in names:
-            row = Gtk.Button(label=name, css_classes=["flat"])
-            row.connect("clicked", lambda _row, chosen=name: (self.model.set_text(chosen), popover.popdown()))
-            self.models.append(row)
-        button.set_sensitive(bool(names))
+    def _provider_changed(self, *_: Any) -> None:
+        self._show_provider_rows()
+        self._fetch_models()
+
+    def _model_settings(self) -> dict[str, str]:
+        return {"model_provider": _PROVIDERS[self.provider.get_selected()][0],
+                "model_url": self.endpoint.get_text().strip(), "agent": _AGENTS[self.agent.get_selected()][0],
+                "api_key_file": self.key_file.get_text().strip(), "api_key_env": self.key_env.get_text().strip()}
+
+    def _selected_model(self) -> str:
+        index = self.model.get_selected()
+        return self.model_values[index] if 0 <= index < len(self.model_values) else ""
+
+    def _fetch_models(self) -> None:
+        """Ask the provider in the form, saved or not, which models it offers."""
+        self.fetches += 1
+        fetch, keep, changes = self.fetches, self._selected_model(), self._model_settings()
+        self._show_models([], keep, loading=True)
+        self.window.background.run(lambda: self.window.gallery.models(**changes),
+                                   lambda names: self._fetched(fetch, names, keep),
+                                   lambda exc: self._fetched(fetch, [], keep))
+
+    def _fetched(self, fetch: int, names: list[str], keep: str) -> None:
+        if fetch == self.fetches:
+            self._show_models(names, keep)
+
+    def _show_models(self, names: list[str], keep: str, *, loading: bool = False) -> None:
+        agent = _PROVIDERS[self.provider.get_selected()][0] == "agent"
+        values = ([""] if agent else []) + names  # "" is the agent's default model.
+        if keep and keep not in values:
+            # Keep a saved model the list does not show (an unreachable endpoint, or a full model name).
+            values.insert(1 if agent else 0, keep)
+        if not values:
+            values = [keep]
+        keep = keep if keep in values else values[0]
+        self.model_values = values
+        self.model.set_model(Gtk.StringList.new([value or "Default" for value in values]))
+        self.model.set_selected(values.index(keep) if keep in values else 0)
+        if loading:
+            subtitle = "Loading models…"
+        elif agent:
+            subtitle = "Default uses the agent's own choice."
+        elif names:
+            subtitle = f"{len(names)} model{'s' if len(names) != 1 else ''} at this endpoint. Choose one with vision support."
+        else:
+            subtitle = "The endpoint did not list models; showing the saved model."
+        self.model.set_subtitle(subtitle)
+
+    def _show_provider_rows(self) -> None:
+        provider = _PROVIDERS[self.provider.get_selected()][0]
+        self.endpoint.set_visible(provider != "agent")
+        self.agent.set_visible(provider == "agent")
+        self.key_file.set_visible(provider == "openai")
+        self.key_env.set_visible(provider == "openai")
+        self.model.set_title("Model" if provider == "agent" else "Vision Model")
+
+    def _values(self) -> dict[str, Any]:
+        return {"interval_minutes": int(self.interval.get_value()), "max_artworks": self.count.get_selected() + 1,
+                "model": self._selected_model(), **self._model_settings()}
 
     def _save(self) -> None:
-        values = (int(self.interval.get_value()), self.model.get_text().strip(), self.count.get_selected() + 1)
-        if values == self.saved:
+        values = self._values()
+        prompts = self.prompts.changes()
+        if values == self.saved and not prompts:
             return
-        interval, model, count = values
-        self.window.mutate(lambda: self.window.gallery.save_settings(
-            interval_minutes=interval, model=model, max_artworks=count))
+        gallery = self.window.gallery
+
+        def save() -> str:
+            notices = []
+            if values != self.saved:
+                notices.append(gallery.save_settings(**values))
+            if prompts:
+                notices.append(gallery.save_prompts(prompts))
+            return " ".join(notices)
+
+        self.window.mutate(save)
+
+
+class Prompts(Adw.PreferencesPage):  # type: ignore[misc]
+    """The curator's instructions: editable parts, and the fixed rules shown for transparency."""
+
+    def __init__(self, window: ArtwallWindow) -> None:
+        super().__init__(title="Prompts", icon_name="document-edit-symbolic")
+        intro = Adw.PreferencesGroup(
+            description="These instructions shape how the curator chooses, arranges, and explains art. Edits "
+                        "apply to newly prepared wallpapers, and upcoming ones are prepared again. Facts are "
+                        "still checked against museum records whatever the prompts say. Each wallpaper's "
+                        "details show the exact requests the model received.")
+        self.add(intro)
+        self.views: dict[str, tuple[Any, str]] = {}  # key -> (text view, text when opened)
+        for part, text in window.gallery.prompt_parts():
+            group = Adw.PreferencesGroup(title=part.title, description=part.description)
+            view = _monospace_view(text, editable=True)
+            view.set_size_request(-1, 140)
+            reset = Gtk.Button(label="Reset", valign=Gtk.Align.CENTER, css_classes=["flat"],
+                               tooltip_text="Restore the default instructions")
+            reset.connect("clicked", lambda _button, v=view, default=part.default: v.get_buffer().set_text(default))
+            group.set_header_suffix(reset)
+            group.add(Gtk.Frame(child=view))
+            self.add(group)
+            self.views[part.key] = (view, text)
+        fixed = Adw.PreferencesGroup(title="Always Included",
+                                     description="The answer format and factual limits. These are not editable.")
+        for title, text in FIXED.items():
+            row = Adw.ExpanderRow(title=title, use_markup=False)
+            row.add_row(_monospace_view(text, editable=False))
+            fixed.add(row)
+        self.add(fixed)
+
+    def changes(self) -> dict[str, str | None]:
+        return {key: _text(view) for key, (view, opened) in self.views.items() if _text(view) != opened}
 
 
 class Exclusions(Adw.PreferencesPage):  # type: ignore[misc]

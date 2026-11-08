@@ -168,8 +168,8 @@ class CliTests(HomeTest):
             {"work": 2, "title": "Elsewhere", "body": visible, "box": [0, 0, 500, 500], "source": ""},
         ]}
 
-        def answer(prompt: str, **_: object) -> object:
-            return notes if prompt.startswith("You are a museum educator") else selection
+        def answer(prompt: str, **options: object) -> object:
+            return notes if options.get("purpose") == "Writing teaching notes" else selection
 
         with patch("artwall.curation.ModelCurator._chat", side_effect=answer):
             self.cli("curate", "--count", "1")

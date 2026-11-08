@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import logging
 from pathlib import Path
@@ -249,8 +250,16 @@ class Database:
         return saved if isinstance(saved, dict) else {}
 
     def settings(self, configured: Settings) -> Settings:
-        """The configuration with gallery-saved values applied."""
-        return with_gallery_settings(configured, self.gallery_settings())
+        """The configuration with values saved in the app, including prompt edits, applied."""
+        settings = with_gallery_settings(configured, self.gallery_settings())
+        return replace(settings, prompt_overrides=tuple(sorted(self.prompt_overrides().items())))
+
+    def prompt_overrides(self) -> dict[str, str]:
+        saved = json.loads(self.get_state("prompt_overrides") or "{}")
+        return {str(key): str(value) for key, value in saved.items()} if isinstance(saved, dict) else {}
+
+    def save_prompt_overrides(self, overrides: Mapping[str, str]) -> None:
+        self.set_state("prompt_overrides", json.dumps(dict(overrides), sort_keys=True))
 
     def save_gallery_settings(self, configured: Settings, values: Mapping[str, object]) -> Settings:
         """Validate and save gallery values, returning the settings they produce."""

@@ -49,7 +49,26 @@ def details(window: ArtwallWindow, record: Record, state: State) -> Any:
         box.append(_notes(record))
     box.append(_works(window, record, state))
     box.append(_feedback(window, record))
+    if record.transcript:
+        box.append(_conversation(record))
     return box
+
+
+def _conversation(record: Record) -> Any:
+    group = Adw.PreferencesGroup(
+        title="Curator Conversation",
+        description="The exact requests the model received for this wallpaper and its raw answers, before "
+                    "Artwall checked them. Images were sent alongside and are not shown.")
+    for purpose, prompt, answer in record.transcript:
+        row = Adw.ExpanderRow(title=purpose or "Request", use_markup=False,
+                              subtitle=f"{len(prompt):,} characters sent")
+        for heading, text in (("Prompt", prompt), ("Answer", answer)):
+            body = vbox(spacing=6, margin=12)
+            body.append(label(heading, "heading"))
+            body.append(label(text, "monospace", "caption", selectable=True))
+            row.add_row(body)
+        group.add(row)
+    return group
 
 
 def _reactions(window: ArtwallWindow, record: Record) -> Any:

@@ -145,9 +145,11 @@ def _queue(db: Database, decision: CuratorDecision, settings: Settings, *, queue
     rendered = _render(db, decision, settings, output)
     details = {key: value for key, value in asdict(rendered).items() if key != "path"}
     notes = curator.annotate(rendered.path, decision, pool) if curator is not None else ()
+    transcript = list(curator.transcript) if curator is not None else []
     composition = Composition(identifier, decision, str(rendered.path),
                               render={**details, "width": settings.width, "height": settings.height,
-                                      "settings": curation_fingerprint(settings)}, notes=notes)
+                                      "settings": curation_fingerprint(settings), "transcript": transcript},
+                              notes=notes)
     write_atomic(output.with_suffix(".json"), json.dumps(composition.to_dict(), ensure_ascii=False, indent=2) + "\n")
     db.add_composition(composition, queue_priority=queue_priority)
     return composition
@@ -232,7 +234,8 @@ def cmd_curate(args: argparse.Namespace, settings: Settings) -> None:
             return
     curator = (ModelCurator(settings.model, settings.model_url, description_words=settings.caption_words,
                             provider=settings.model_provider, api_key=model_api_key(settings),
-                            agent=settings.agent, agent_command=settings.agent_command)
+                            agent=settings.agent, agent_command=settings.agent_command,
+                            prompts=dict(settings.prompt_overrides))
                if settings.use_local_model and not args.offline else None)
     created = curated = 0
     started = time.time()
@@ -248,6 +251,8 @@ def cmd_curate(args: argparse.Namespace, settings: Settings) -> None:
             pool = _prepare_images(db, source, _select_pool(db, settings, taste, reserved))
             if not pool:
                 break
+            if curator is not None:
+                curator.transcript.clear()  # This wallpaper's requests only.
             decision = choose_composition(pool, taste, max_artworks=settings.max_artworks,
                                           screen_ratio=settings.width / settings.height, curator=curator,
                                           feedback=db.curation_feedback())

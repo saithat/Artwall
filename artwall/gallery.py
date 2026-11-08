@@ -6,17 +6,18 @@ settings, exclusions, and preparation are tested without a graphical session.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import islice
 import json
 import logging
 from pathlib import Path
+import re
 import secrets
 import shutil
 import subprocess
 import sys
 from threading import Lock, Thread
-from typing import Literal, Sequence
+from typing import Any, Literal, Sequence
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
@@ -27,6 +28,7 @@ from artwall.config import (
     Settings, config_path, curation_fingerprint, data_dir, database_path, load_config, model_api_key,
 )
 from artwall.models import Artwork, Composition, Note
+from artwall.prompts import EDITABLE, PromptPart, resolve, validate_overrides
 from artwall.storage import Database
 from artwall.systemd import next_rotation, restart_rotation, update_rotate_timer, user_unit_dir
 
@@ -66,6 +68,8 @@ class Record:
     reaction: rotation.Reaction
     comment: str
     notes: tuple[Note, ...] = ()
+    # The curator's requests and raw answers for this wallpaper: (purpose, prompt, answer).
+    transcript: tuple[tuple[str, str, str], ...] = ()
 
     @property
     def title(self) -> str:
@@ -132,7 +136,7 @@ class Gallery:
                       composition.decision.relationship, composition.decision.layout,
                       Path(composition.output_path), composition.created_at, composition.shown_at,
                       rotation.Reaction.stored(db.get_feedback(composition.id)), db.get_comment(composition.id),
-                      composition.notes)
+                      composition.notes, _transcript(composition.render.get("transcript")))
 
     def state(self) -> State:
         """A factual view of the current wallpaper, the queue, and history."""
@@ -201,22 +205,55 @@ class Gallery:
         """When the rotation timer shows the next wallpaper (Unix time), if timers are installed."""
         return next_rotation()
 
-    def save_settings(self, *, interval_minutes: int, model: str, max_artworks: int) -> str:
-        """Validate and save the gallery's settings, updating an installed rotation timer."""
+    def save_settings(self, *, interval_minutes: int, model: str, max_artworks: int, **model_settings: str) -> str:
+        """Validate and save the app's settings, updating the rotation timer and the upcoming queue.
+
+        ``model_settings`` may set model_provider, model_url, agent, api_key_env, and api_key_file.
+        The API key itself is never saved; only where to read it.
+        """
+        unknown = set(model_settings) - _MODEL_SETTINGS
+        if unknown:
+            raise ValueError(f"Unknown setting: {sorted(unknown)[0]}")
         model = model.strip()
         configured = load_config(self.config_file)
+        with self._database() as db:
+            old = db.settings(configured)
+        provider = model_settings.get("model_provider", old.model_provider)
         # An agent may use its own default model; model servers need a name.
-        if ((not model and configured.model_provider != "agent") or len(model) > 120
-                or any(ord(ch) < 32 for ch in model)):
+        if (not model and provider != "agent") or len(model) > 120 or any(ord(ch) < 32 for ch in model):
             raise ValueError("Enter a valid model name")
         if not 15 <= interval_minutes <= 1440:
             raise ValueError("Rotation interval must be 15–1440 minutes")
+        variable = model_settings.get("api_key_env")
+        if variable is not None and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,100}", variable):
+            raise ValueError("Enter an environment variable name such as OPENAI_API_KEY")
+        values = {"interval_minutes": interval_minutes, "max_artworks": max_artworks, "model": model,
+                  **{key: value.strip() for key, value in model_settings.items()}}
+        with self._database() as db:
+            settings = db.save_gallery_settings(configured, values)
+            settings = db.settings(configured)
+        return self._apply("Settings saved.", old, settings)
+
+    def prompt_parts(self) -> list[tuple[PromptPart, str]]:
+        """Each editable instruction with the text the curator uses now."""
+        with self._database() as db:
+            current = resolve(db.prompt_overrides())
+        return [(part, current[part.key]) for part in EDITABLE]
+
+    def save_prompts(self, texts: dict[str, str | None]) -> str:
+        """Save edited instructions; text equal to the default, or empty, restores the default."""
+        configured = load_config(self.config_file)
         with self._database() as db:
             old = db.settings(configured)
-            settings = db.save_gallery_settings(configured, {
-                "interval_minutes": interval_minutes, "max_artworks": max_artworks, "model": model})
-        notice = "Settings saved."
-        if interval_minutes != old.interval_minutes:
+            overrides = {**db.prompt_overrides(), **{key: "" for key in texts}}
+            overrides.update(validate_overrides({k: v for k, v in texts.items()}))
+            db.save_prompt_overrides({key: value for key, value in overrides.items() if value})
+            settings = db.settings(configured)
+        return self._apply("Curator instructions saved.", old, settings)
+
+    def _apply(self, notice: str, old: Settings, settings: Settings) -> str:
+        """Follow a settings change through: the rotation timer, then the upcoming queue."""
+        if settings.interval_minutes != old.interval_minutes:
             executable = shutil.which("artwall")
             if not executable or not update_rotate_timer(settings, str(Path(executable).resolve()),
                                                          directory=self.unit_dir):
@@ -252,9 +289,26 @@ class Gallery:
             db.set_artwork_blacklisted(artwork_id, blocked)
         return f"{art.title or 'Artwork'} {'excluded' if blocked else 'allowed again'}"
 
-    def models(self) -> list[str]:
-        """Model names the configured endpoint offers, or [] when it cannot be asked quickly."""
-        return available_models(self.settings())
+    def models(self, **changes: str) -> list[str]:
+        """Model names to choose from, for the saved settings or unsaved ``changes`` to them.
+
+        Model servers are asked for their list; Claude Code offers its aliases. An
+        empty list means the endpoint could not be asked quickly.
+        """
+        unknown = set(changes) - _MODEL_SETTINGS
+        if unknown:
+            raise ValueError(f"Unknown setting: {sorted(unknown)[0]}")
+        settings = self.settings()
+        values: dict[str, Any] = {key: value.strip() for key, value in changes.items()}
+        if "api_key_file" in values:
+            values["api_key_file"] = values["api_key_file"] or None
+        try:
+            settings = replace(settings, **values)
+        except ValueError:
+            return []  # For example an endpoint that is not a URL yet.
+        if settings.model_provider == "agent":
+            return list(_AGENT_MODELS.get(settings.agent, ()))
+        return available_models(settings)
 
     def thumbnail(self, record: Record, size: tuple[int, int] = (800, 400)) -> Path:
         """A cached JPEG preview of a composition for card grids."""
@@ -344,6 +398,17 @@ class Gallery:
                                 "No new wallpapers could be prepared. Check the museum connection and try again.")
         with self._lock:
             self._preparation = final
+
+
+_MODEL_SETTINGS = {"model_provider", "model_url", "agent", "api_key_env", "api_key_file"}
+# Claude Code accepts these aliases for its latest models; other agents name their own.
+_AGENT_MODELS = {"claude": ("fable", "opus", "sonnet", "haiku")}
+
+
+def _transcript(raw: object) -> tuple[tuple[str, str, str], ...]:
+    entries = raw if isinstance(raw, list) else []
+    return tuple((str(entry.get("purpose", "")), str(entry.get("prompt", "")), str(entry.get("answer", "")))
+                 for entry in entries if isinstance(entry, dict))
 
 
 def available_models(settings: Settings) -> list[str]:

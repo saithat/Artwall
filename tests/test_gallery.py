@@ -179,6 +179,56 @@ class GalleryTests(HomeTest):
         self.assertIn("systemctl --user try-restart artwall-rotate.timer", self.commands())
         self.assertEqual(self.score(), -1)
 
+    def test_edited_instructions_reach_the_model_and_its_conversation_is_kept(self):
+        teaching = "Teach like a printmaker: point at how each mark was made."
+        self.assertIn("Curator instructions saved", self.gallery.save_prompts({"notes": teaching}))
+        self.assertEqual(dict((part.key, text) for part, text in self.gallery.prompt_parts())["notes"], teaching)
+        self.wait_for_preparation()  # The edit re-prepares upcoming wallpapers (here without a model).
+        art = self.artwork("taught", (1800, 1400), title="A Museum Title",
+                           museum_description="A dark hillside slopes down to the water.")
+        with self.database() as db:
+            db.upsert_artwork(art)
+        choice = json.dumps(CuratorDecision(Whole(DecisionArtwork(art.id))).to_dict())
+        notes = json.dumps({"notes": [{"work": 1, "title": "Cut lines", "box": [100, 100, 400, 400], "source": "",
+                                       "body": "Short parallel cuts darken the hillside where the light falls away."}]})
+        with patch("artwall.curation.ModelCurator._ask",
+                   side_effect=lambda prompt, *_: notes if "Box coordinates" in prompt else choice):
+            self.cli("curate", "--count", "1")
+        record = next(r for r in self.gallery.state().queued if art.id in [w.id for w in r.works])
+        purposes = [purpose for purpose, _prompt, _answer in record.transcript]
+        self.assertEqual((purposes[0], purposes[-1]), ("Choosing the art", "Writing teaching notes"))
+        self.assertIn(teaching, record.transcript[-1][1])
+        self.assertEqual(record.transcript[-1][2], notes)
+        self.assertEqual([note.title for note in record.notes], ["Cut lines"])
+        # Saving the default text (or nothing) restores the default.
+        default = next(part.default for part, _text in self.gallery.prompt_parts() if part.key == "notes")
+        self.gallery.save_prompts({"notes": default})
+        self.wait_for_preparation()
+        with self.database() as db:
+            self.assertEqual(db.prompt_overrides(), {})
+        with self.assertRaises(ValueError):
+            self.gallery.save_prompts({"unknown": "text"})
+
+    def test_model_settings_are_validated_and_never_store_a_key(self):
+        self.config_file.write_text(self.config.replace("[llm]\n", "[llm]\nenabled = false\n"))
+        self.gallery.save_settings(interval_minutes=120, model="vision-a", max_artworks=1, model_provider="openai",
+                                   model_url="http://127.0.0.1:9/v1", api_key_env="MY_KEY", api_key_file=" ")
+        self.wait_for_preparation()
+        saved = self.gallery.settings()
+        self.assertEqual((saved.model_provider, saved.model_url, saved.api_key_env, saved.api_key_file),
+                         ("openai", "http://127.0.0.1:9/v1", "MY_KEY", None))
+        for bad in ({"model_url": "ftp://example"}, {"api_key_env": "not a name"}, {"model_provider": "magic"},
+                    {"agent": "someone"}, {"api_key": "sk-secret"}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.gallery.save_settings(interval_minutes=120, model="vision-a", max_artworks=1, **bad)
+        # The model dropdown lists choices for unsaved settings too.
+        self.assertEqual(self.gallery.models(model_provider="agent", agent="claude"), ["fable", "opus", "sonnet", "haiku"])
+        self.assertEqual(self.gallery.models(model_provider="agent", agent="codex"), [])
+        self.assertEqual(self.gallery.models(model_url="not a url"), [])
+        # An agent may keep its own default model.
+        self.gallery.save_settings(interval_minutes=120, model="", max_artworks=1, model_provider="agent")
+        self.assertEqual(self.gallery.settings().model_provider, "agent")
+
     def test_written_feedback_is_saved_with_context_and_sent_to_future_curation(self):
         comment = "Less empty space, and pair prints with a similar tonal range."
         notice = self.gallery.set_comment("current", "  " + comment + "\n")
