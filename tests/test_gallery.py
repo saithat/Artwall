@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from hypothesis import example, given, settings, strategies as st
 
+from artwall.config import MAX_INTERVAL_MINUTES
 from artwall.gallery import Gallery, Preparation, Record
 from artwall.models import CuratorDecision, DecisionArtwork, Whole
 from artwall.systemd import user_unit_dir
@@ -137,7 +138,7 @@ class GalleryTests(HomeTest):
         self.assertEqual(self.commands(), [])
 
     @settings(max_examples=12, database=None, deadline=None, derandomize=True)
-    @given(interval=st.integers(min_value=0, max_value=1500),
+    @given(interval=st.integers(min_value=0, max_value=MAX_INTERVAL_MINUTES + 100),
            model=st.text(alphabet='abcXYZ0123:#"\\ ', min_size=1, max_size=20).filter(str.strip))
     @example(interval=1, model="local")
     @example(interval=180, model="llava:latest")
@@ -150,7 +151,7 @@ class GalleryTests(HomeTest):
         try:
             self.gallery.save_settings(interval_minutes=interval, model=model, max_artworks=2)
         except ValueError:
-            self.assertFalse(15 <= interval <= 1440)
+            self.assertFalse(15 <= interval <= MAX_INTERVAL_MINUTES)
             self.assertEqual(self.gallery.settings(), before)
             return
         self.assertEqual(self.config_file.read_text(), config)  # The gallery never rewrites config.toml.

@@ -27,7 +27,7 @@ from PIL import Image, ImageOps
 
 from artwall import rotation
 from artwall.config import (
-    Settings, config_path, curation_fingerprint, data_dir, database_path, load_config, model_api_key,
+    MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES, Settings, config_path, curation_fingerprint, data_dir, database_path, load_config, model_api_key,
 )
 from artwall.models import Artwork, Composition, Note
 from artwall.prompts import EDITABLE, PromptPart, resolve, validate_overrides
@@ -248,8 +248,8 @@ class Gallery:
         # An agent may use its own default model; model servers need a name.
         if (not model and provider != "agent") or len(model) > 120 or any(ord(ch) < 32 for ch in model):
             raise ValueError("Enter a valid model name")
-        if not 15 <= interval_minutes <= 1440:
-            raise ValueError("Rotation interval must be 15–1440 minutes")
+        if not MIN_INTERVAL_MINUTES <= interval_minutes <= MAX_INTERVAL_MINUTES:
+            raise ValueError("Rotation interval must be between 15 minutes and 7 days")
         variable = model_settings.get("api_key_env")
         if variable is not None and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,100}", variable):
             raise ValueError("Enter an environment variable name such as OPENAI_API_KEY")

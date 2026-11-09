@@ -55,6 +55,9 @@ def write_atomic(path: Path, text: str) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
+MIN_INTERVAL_MINUTES = 15
+MAX_INTERVAL_MINUTES = 7 * 24 * 60
+
 @dataclass(frozen=True)
 class Settings:
     width: int = 1920
@@ -93,7 +96,8 @@ class Settings:
     def __post_init__(self) -> None:
         checks = (
             (self.width >= 320 and self.height >= 240, "Display size must be at least 320 × 240"),
-            (self.interval_minutes >= 15, "Rotation interval must be at least 15 minutes"),
+            (MIN_INTERVAL_MINUTES <= self.interval_minutes <= MAX_INTERVAL_MINUTES,
+             "Rotation interval must be between 15 minutes and 7 days"),
             (1 <= self.max_artworks <= 3, "max_artworks must be from 1 to 3"),
             (1 <= self.queue_size <= 30, "queue_size must be from 1 to 30"),
             (1 <= self.candidate_pool_size <= 100, "candidate_pool_size must be from 1 to 100"),

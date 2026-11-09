@@ -10,11 +10,24 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gtk  # noqa: E402
 
+from artwall.config import MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES  # noqa: E402
 from artwall.gallery import State, Work  # noqa: E402
 from artwall.prompts import FIXED  # noqa: E402
 
 if TYPE_CHECKING:
     from artwall.app.window import ArtwallWindow
+
+# Rotation interval units: name, minutes in one, smallest amount, spin step.
+_UNITS = (("minutes", 1, MIN_INTERVAL_MINUTES, 5), ("hours", 60, 1, 1), ("days", 24 * 60, 1, 1))
+
+
+def split_interval(minutes: int) -> tuple[int, int]:
+    """The largest unit that shows a saved interval exactly: (amount, unit index)."""
+    for index in (2, 1, 0):
+        if minutes % _UNITS[index][1] == 0:
+            return minutes // _UNITS[index][1], index
+    return minutes, 0
+
 
 _PROVIDERS = (("ollama", "Ollama (local)"), ("openai", "OpenAI-Compatible API"), ("agent", "Agent CLI (subscription)"))
 _AGENTS = (("claude", "Claude Code"), ("codex", "Codex"), ("command", "Custom command (config.toml)"))
@@ -49,15 +62,24 @@ class Preferences(Adw.PreferencesDialog):  # type: ignore[misc]
         settings = state.settings
         page = Adw.PreferencesPage(title="Curator", icon_name="preferences-system-symbolic")
         rotation = Adw.PreferencesGroup(title="Rotation")
-        self.interval = Adw.SpinRow.new_with_range(15, 1440, 15)
-        self.interval.set_title("Change Wallpaper Every")
-        self.interval.set_subtitle("Minutes. Give each work enough time to be seen.")
-        self.interval.set_value(settings.interval_minutes)
+        amount, unit = split_interval(settings.interval_minutes)
+        self.interval = Gtk.SpinButton(valign=Gtk.Align.CENTER, numeric=True)
+        self.interval.update_property([Gtk.AccessibleProperty.LABEL], ["Change wallpaper every"])
+        self.unit = Gtk.DropDown(model=Gtk.StringList.new([name for name, *_ in _UNITS]), valign=Gtk.Align.CENTER)
+        self.unit.update_property([Gtk.AccessibleProperty.LABEL], ["Interval unit"])
+        self.unit.set_selected(unit)
+        self._set_interval_range(amount)
+        self.unit.connect("notify::selected", lambda *_: self._unit_changed())
+        self.unit_shown = unit
+        every = Adw.ActionRow(title="Change Wallpaper Every",
+                              subtitle="From 15 minutes to 7 days. Give each work enough time to be seen.")
+        every.add_suffix(self.interval)
+        every.add_suffix(self.unit)
         self.count = Adw.ComboRow(title="Works on One Wallpaper",
                                   subtitle="Related works can share the wall when they fit together well.",
                                   model=Gtk.StringList.new(["One", "Up to two", "Up to three"]))
         self.count.set_selected(settings.max_artworks - 1)
-        rotation.add(self.interval)
+        rotation.add(every)
         rotation.add(self.count)
         tray = Adw.SwitchRow(title="Show in System Tray", active=self.window.gallery.tray_enabled(),
                              subtitle="The current work and quick actions, from login on.")
@@ -97,6 +119,21 @@ class Preferences(Adw.PreferencesDialog):  # type: ignore[misc]
         self._fetch_models()
         page.add(curator)
         return page
+
+    def _set_interval_range(self, amount: float) -> None:
+        _name, size, lowest, step = _UNITS[self.unit.get_selected()]
+        self.interval.set_range(lowest, MAX_INTERVAL_MINUTES // size)
+        self.interval.set_increments(step, step * (6 if size == 1 else 1))
+        self.interval.set_value(amount)
+
+    def _unit_changed(self) -> None:
+        """Keep about the same interval in the new unit: 120 minutes become 2 hours."""
+        minutes = self.interval.get_value() * _UNITS[self.unit_shown][1]
+        self.unit_shown = self.unit.get_selected()
+        self._set_interval_range(max(1, round(minutes / _UNITS[self.unit_shown][1])))
+
+    def _interval_minutes(self) -> int:
+        return int(self.interval.get_value()) * _UNITS[self.unit.get_selected()][1]
 
     def _provider_changed(self, *_: Any) -> None:
         self._show_provider_rows()
@@ -169,7 +206,7 @@ class Preferences(Adw.PreferencesDialog):  # type: ignore[misc]
         self.model.set_title("Model" if provider == "agent" else "Vision Model")
 
     def _values(self) -> dict[str, Any]:
-        return {"interval_minutes": int(self.interval.get_value()), "max_artworks": self.count.get_selected() + 1,
+        return {"interval_minutes": self._interval_minutes(), "max_artworks": self.count.get_selected() + 1,
                 "model": self._selected_model(), **self._model_settings()}
 
     def _save(self) -> None:
