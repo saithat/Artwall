@@ -147,6 +147,11 @@ class LiveDesktopTests(HomeTest):
                  "box": {"x": 0.2, "y": 0.68, "width": 0.6, "height": 0.28},
                  "source": "A pale sun hangs over dark water while two small boats rest near the far bank and "
                            "clouds drift across a wide sky."}]
+            # A conversation with long unbroken tokens, as real prompts and answers have.
+            token = "https://www.artic.edu/iiif/2/" + "a1b2c3d4" * 40 + "/full/843,/0/default.jpg"
+            payload.setdefault("render", {})["transcript"] = [
+                {"purpose": "Choosing the art", "prompt": "Candidates: " + token + " " + "word " * 3000,
+                 "answer": '{"layout":"single","artworks":[{"id":"' + "x" * 300 + '"}]}'}]
             db.connection.execute("UPDATE compositions SET payload = ? WHERE id = ?",
                                   (json.dumps(payload), current.id))
             db.connection.commit()

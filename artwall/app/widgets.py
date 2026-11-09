@@ -49,13 +49,24 @@ class Background:
 
 
 def label(text: str, *classes: str, wrap: bool = True, selectable: bool = False, lines: int = 0) -> Any:
-    widget = Gtk.Label(label=text, xalign=0, wrap=wrap, selectable=selectable, css_classes=list(classes))
+    # Breaking inside long words (URLs, JSON) keeps one token from widening the whole page.
+    widget = Gtk.Label(label=text, xalign=0, wrap=wrap, wrap_mode=Pango.WrapMode.WORD_CHAR, selectable=selectable,
+                       css_classes=list(classes))
     if not wrap:
         widget.set_ellipsize(Pango.EllipsizeMode.END)
     if lines:
         widget.set_lines(lines)
         widget.set_ellipsize(Pango.EllipsizeMode.END)
     return widget
+
+
+def text_view(text: str, *classes: str, max_height: int = 360) -> Any:
+    """Long read-only text in its own scrolling box, so it neither widens nor floods the page."""
+    view = Gtk.TextView(editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.WORD_CHAR, top_margin=10,
+                        bottom_margin=10, left_margin=12, right_margin=12, css_classes=list(classes))
+    view.get_buffer().set_text(text)
+    return Gtk.ScrolledWindow(child=view, hscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True,
+                              max_content_height=max_height, css_classes=["card"])
 
 
 def vbox(spacing: int = 12, margin: int = 0) -> Any:

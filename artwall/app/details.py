@@ -11,7 +11,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gtk  # noqa: E402
 
-from artwall.app.widgets import label, vbox, web_link  # noqa: E402
+from artwall.app.widgets import label, text_view, vbox, web_link  # noqa: E402
 from artwall.gallery import Record, State  # noqa: E402
 from artwall.rotation import Vote  # noqa: E402
 
@@ -65,7 +65,7 @@ def _conversation(record: Record) -> Any:
         for heading, text in (("Prompt", prompt), ("Answer", answer)):
             body = vbox(spacing=6, margin=12)
             body.append(label(heading, "heading"))
-            body.append(label(text, "monospace", "caption", selectable=True))
+            body.append(text_view(text, "monospace", "caption"))
             row.add_row(body)
         group.add(row)
     return group
