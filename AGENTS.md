@@ -19,7 +19,8 @@ museum facts authoritative, and rotation usable without a network or model.
 - `artwall/render.py`: deterministic wallpaper layouts and captions.
 - `artwall/storage.py`: SQLite catalog, queue, history, and feedback.
 - `artwall/rotation.py`: offline rotation, navigation history, and votes.
-- `artwall/desktop/`: wallpaper, lock-screen, and display-size adapters per desktop.
+- `artwall/desktop/`: wallpaper, lock-screen, and display-size adapters per desktop, and the
+  StatusNotifierItem tray (`tray.py`, Gio only).
 - `artwall/config.py`: TOML configuration and validation.
 - `artwall/cli.py`: command orchestration; keep substantial logic in modules.
 - `artwall/gallery.py`: the app's behavior (state, votes, settings, exclusions, preparation), toolkit-free.

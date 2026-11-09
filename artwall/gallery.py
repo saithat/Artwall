@@ -32,7 +32,7 @@ from artwall.config import (
 from artwall.models import Artwork, Composition, Note
 from artwall.prompts import EDITABLE, PromptPart, resolve, validate_overrides
 from artwall.storage import Database
-from artwall.systemd import next_rotation, restart_rotation, update_rotate_timer, user_unit_dir
+from artwall.systemd import next_rotation, restart_rotation, set_tray, tray_enabled, update_rotate_timer, user_unit_dir
 
 LOG = logging.getLogger(__name__)
 BATCH = 3  # Wallpapers made by one "Prepare new wallpapers" request.
@@ -164,6 +164,12 @@ class Gallery:
                 works=tuple(Work.of(art) for art in works),
             )
 
+    def current(self) -> Record | None:
+        """Only the wallpaper on the wall now: cheaper than ``state`` for frequent checks."""
+        with self._database() as db:
+            composition = db.get_current()
+            return self._record(db, composition) if composition else None
+
     def vote(self, composition_id: str, kind: rotation.Vote, expected_current: str | None = None) -> str:
         """Toggle a reaction; thumbs down on the current wallpaper also shows the next one."""
         with self._vote_lock, self._database() as db:
@@ -210,6 +216,20 @@ class Gallery:
     def next_change(self) -> float | None:
         """When the rotation timer shows the next wallpaper (Unix time), if timers are installed."""
         return next_rotation()
+
+    def tray_enabled(self) -> bool:
+        return tray_enabled(self.unit_dir)
+
+    def set_tray(self, enabled: bool) -> str:
+        """Show the tray icon now and at each login, or remove it."""
+        executable = shutil.which("artwall")
+        if enabled and not executable:
+            raise ValueError("Install the artwall command first to use the tray (see README: Install).")
+        try:
+            set_tray(enabled, str(Path(executable).resolve()) if executable else "", directory=self.unit_dir)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise ValueError(f"Could not change the tray service: {exc}") from exc
+        return "Artwall is in the system tray." if enabled else "Artwall left the system tray."
 
     def save_settings(self, *, interval_minutes: int, model: str, max_artworks: int, **model_settings: str) -> str:
         """Validate and save the app's settings, updating the rotation timer and the upcoming queue.

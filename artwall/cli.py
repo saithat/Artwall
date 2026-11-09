@@ -30,7 +30,7 @@ from artwall.render import RenderResult, RenderSettings, render_wallpaper
 from artwall.sources.artic import ArticSource
 from artwall.sources.base import ArtworkSource
 from artwall.storage import Database
-from artwall.systemd import user_unit_dir, write_units
+from artwall.systemd import set_tray, user_unit_dir, write_units
 
 
 LOG = logging.getLogger("artwall")
@@ -441,6 +441,18 @@ def cmd_explain(args: argparse.Namespace, settings: Settings) -> None:
     run([sys.argv[0], "--explain"])
 
 
+def cmd_tray(args: argparse.Namespace, settings: Settings) -> None:
+    from artwall.desktop.tray import run_tray
+
+    run_tray()
+
+
+def cmd_install_tray(args: argparse.Namespace, settings: Settings) -> None:
+    set_tray(not args.remove, _executable())
+    print("Artwall left the system tray." if args.remove else
+          "Artwall is in the system tray now and after each login.")
+
+
 def cmd_install_launcher(args: argparse.Namespace, settings: Settings) -> None:
     for path in install_launcher(_executable()):
         print(path)
@@ -472,6 +484,8 @@ _COMMANDS: dict[str, tuple[Handler, str]] = {
     "gui": (cmd_gui, "open the Artwall app"),
     "explain": (cmd_explain, "show the current wallpaper full screen with the curator's notes"),
     "install-launcher": (cmd_install_launcher, "add the Artwall app to your app launcher"),
+    "tray": (cmd_tray, "show Artwall in the system tray"),
+    "install-tray": (cmd_install_tray, "start the tray icon now and at each login"),
 }
 
 
@@ -506,6 +520,8 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--avoid", default="", help="comma-separated artwork IDs not to use this time")
         if name in ("more-from-artist", "less-from-artist", "blacklist-artist"):
             command.add_argument("artist", nargs="?", help="defaults to the current primary artist")
+        if name == "install-tray":
+            command.add_argument("--remove", action="store_true", help="stop the tray icon and remove it from login")
         if name == "install-timers":
             command.add_argument("--no-enable", action="store_true", help="write units without enabling timers")
     return parser

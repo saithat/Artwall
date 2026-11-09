@@ -35,6 +35,7 @@ artwall next                    Next cached composition
 artwall gui                     Open the Artwall app
 artwall explain                 The current wallpaper full screen, with the curator's notes
 artwall install-launcher        Add the app to your app launcher
+artwall install-tray            Show Artwall in the system tray now and at each login (--remove to stop)
 artwall previous                Return to an earlier composition
 artwall like | dislike          Teach taste; dislike also shows the next work
 artwall favorite | skip         Save or move on
@@ -62,6 +63,10 @@ Open **Artwall** from your app launcher, or run `artwall gui`. It is a native GT
 Six wallpapers stay prepared (`[curation].queue_size`). **Regenerate** in an upcoming wallpaper's details replaces just that one; **Regenerate All** on **Coming Next** replaces the whole queue after confirming. Replacements avoid the works they replace, run in the background with your saved settings and feedback, and show progress beside the button, which becomes **Cancel** while they run. Cancelling stops the curator (including an agent CLI it started) and keeps wallpapers already finished; hourly curation fills the rest of the queue. **Next Wallpaper** shows the next prepared one now and restarts the rotation timer, so it gets a full interval; the countdown reads that timer.
 
 When a setting that shapes wallpapers changes (display size, artwork limit, curator provider, model, endpoint or agent, or captions), upcoming wallpapers are prepared again with it: at once when you save in the app, and at the next hourly curation for a `config.toml` edit. Old ones stay in the queue until their replacements exist, so rotation never runs dry.
+
+## System tray
+
+`artwall install-tray`, or **Show in System Tray** under Preferences, adds an Artwall icon to the tray at every login through a user systemd service (`artwall-tray.service`). Its menu shows the current work and offers **Open Artwall**, **Explain This Wallpaper**, **Next Wallpaper**, **Like**, **Not for Me**, and **Favorite**; the tooltip shows the countdown to the next change. Clicking the icon opens the app, and middle-clicking explains the wallpaper. The tray uses the StatusNotifierItem protocol, which KDE Plasma, DankMaterialShell, Waybar, XFCE, Cinnamon, and other panels show; GNOME needs the *AppIndicator and KStatusNotifierItem Support* extension. `artwall tray` runs it in the foreground.
 
 ## Explain
 
@@ -216,7 +221,7 @@ Model output is fuzzed with Hypothesis (`tests/test_model_output.py`): arbitrary
 
 To check curation against a running vision model, run `bash scripts/check-model`. It uses Ollama with `qwen3.6:27b` by default; set `ARTWALL_TEST_MODEL` and `ARTWALL_TEST_MODEL_URL`, plus `ARTWALL_TEST_PROVIDER=openai` for an OpenAI-compatible server.
 
-`bash scripts/check-desktops` builds a Fedora container with the real GNOME, Cinnamon, MATE, Xfce, Plasma lock-screen, Sway, and X11 (`feh`, `xrandr`) tools, starts headless Sway and Xvfb, and checks each backend by reading the setting back with the desktop's own tool. It also starts the Artwall app under headless Sway and switches through its pages and Preferences; set `ARTWALL_SCREENSHOTS=DIR` to save a screenshot of each. It needs podman (or `CONTAINER=docker`) and network access for the first build. Applying a Plasma wallpaper needs a running plasmashell and is not covered; nor are DMS, swww, or full desktop sessions.
+`bash scripts/check-desktops` builds a Fedora container with the real GNOME, Cinnamon, MATE, Xfce, Plasma lock-screen, Sway, and X11 (`feh`, `xrandr`) tools, starts headless Sway and Xvfb, and checks each backend by reading the setting back with the desktop's own tool. It also starts the Artwall app under headless Sway and switches through its pages and Preferences, and drives the tray menu over D-Bus against a stand-in tray host; set `ARTWALL_SCREENSHOTS=DIR` to save a screenshot of each. It needs podman (or `CONTAINER=docker`) and network access for the first build. Applying a Plasma wallpaper needs a running plasmashell and is not covered; nor are DMS, swww, or full desktop sessions.
 
 These live checks are separate from CI.
 

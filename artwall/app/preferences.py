@@ -59,6 +59,11 @@ class Preferences(Adw.PreferencesDialog):  # type: ignore[misc]
         self.count.set_selected(settings.max_artworks - 1)
         rotation.add(self.interval)
         rotation.add(self.count)
+        tray = Adw.SwitchRow(title="Show in System Tray", active=self.window.gallery.tray_enabled(),
+                             subtitle="The current work and quick actions, from login on.")
+        tray.connect("notify::active", lambda row, _param: self.window.mutate(
+            lambda: self.window.gallery.set_tray(row.get_active())))
+        rotation.add(tray)
         page.add(rotation)
 
         curator = Adw.PreferencesGroup(

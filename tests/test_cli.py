@@ -438,6 +438,21 @@ class CliTests(HomeTest):
         self.cli("next", "--no-apply")
         self.assertEqual(self.current_id(), "third")
 
+    def test_tray_starts_at_login_until_removed(self):
+        self.cli("install-tray")
+        unit = self.root / "config" / "systemd" / "user" / "artwall-tray.service"
+        text = unit.read_text()
+        self.assertIn(f"ExecStart={(self.root / 'bin' / 'artwall').resolve()} tray", text)
+        self.assertIn("WantedBy=graphical-session.target", text)
+        self.assertIn("KillMode=process", text)  # Windows opened from the tray outlive a tray restart.
+        self.assertEqual(self.commands(), ["systemctl --user daemon-reload",
+                                           "systemctl --user enable --now artwall-tray.service",
+                                           "systemctl --user restart artwall-tray.service"])
+        self.cli("install-tray", "--remove")
+        self.assertFalse(unit.exists())
+        self.assertEqual(self.commands()[3:], ["systemctl --user disable --now artwall-tray.service",
+                                               "systemctl --user daemon-reload"])
+
     def test_upgrade_survives_concurrent_and_interrupted_migrations(self):
         self.configure("[curation]\nmax_artworks = 2\n")
         with self.database() as db:

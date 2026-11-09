@@ -122,6 +122,87 @@ class LiveDesktopTests(HomeTest):
         with patch.dict(os.environ, x11):
             self.assertIn("Display: 1600 × 900 (detected)", self.cli("init"))
 
+    def test_tray_registers_with_the_host_and_its_menu_drives_rotation(self):
+        """A fake StatusNotifierWatcher stands in for the desktop's tray host."""
+        import gi
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio, GLib
+
+        with self.database() as db:
+            for identifier, title in (("harbor", "Harbor at Dusk"), ("clouds", "Study of Clouds")):
+                self.queue(db, identifier, self.artwork(identifier, title=title, artist="Jane Etcher"))
+        self.cli("next", "--no-apply")
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        registered: list[str] = []
+        watcher = Gio.DBusNodeInfo.new_for_xml(
+            '<node><interface name="org.kde.StatusNotifierWatcher"><method name="RegisterStatusNotifierItem">'
+            '<arg name="service" type="s" direction="in"/></method></interface></node>').interfaces[0]
+
+        def register(_bus, _sender, _path, _interface, _method, parameters, invocation):
+            registered.append(parameters.unpack()[0])
+            invocation.return_value(None)
+
+        context = GLib.MainContext.new()
+        context.push_thread_default()
+        self.addCleanup(context.pop_thread_default)
+        bus.register_object("/StatusNotifierWatcher", watcher, register, None, None)
+        Gio.bus_own_name_on_connection(bus, "org.kde.StatusNotifierWatcher", Gio.BusNameOwnerFlags.NONE, None, None)
+        tray = subprocess.Popen([sys.executable, "-P", "-m", "artwall.cli", "tray"], text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+                                     "XDG_CURRENT_DESKTOP": "sway", "SWAYSOCK": os.environ["ARTWALL_TEST_SWAYSOCK"],
+                                     "WAYLAND_DISPLAY": os.environ["ARTWALL_TEST_WAYLAND_DISPLAY"]})
+        self.addCleanup(tray.kill)
+        deadline = time.monotonic() + 15
+        while not registered and time.monotonic() < deadline and tray.poll() is None:
+            context.iteration(False)
+            time.sleep(0.05)
+        if not registered:
+            tray.kill()
+            self.fail("The tray did not register:\n" + tray.communicate()[0])
+        self.assertEqual(registered, [f"org.kde.StatusNotifierItem-{tray.pid}-1"])
+
+        def call(path, interface, method, signature, *args):
+            return bus.call_sync(registered[0], path, interface, method, GLib.Variant(signature, args) if signature
+                                 else None, None, Gio.DBusCallFlags.NONE, 5000, None).unpack()
+
+        def menu():
+            _revision, (_root, _props, children) = call("/MenuBar", "com.canonical.dbusmenu", "GetLayout",
+                                                        "(iias)", 0, -1, [])
+            return {props.get("label", "-"): number for number, props, _children in children}
+
+        def tooltip():
+            return call("/StatusNotifierItem", "org.freedesktop.DBus.Properties", "Get", "(ss)",
+                        "org.kde.StatusNotifierItem", "ToolTip")[0][3]
+
+        self.assertEqual(call("/StatusNotifierItem", "org.freedesktop.DBus.Properties", "Get", "(ss)",
+                              "org.kde.StatusNotifierItem", "Menu")[0], "/MenuBar")
+        items = menu()
+        self.assertIn("Harbor at Dusk", items)
+        self.assertIn("Harbor at Dusk", tooltip())
+        call("/MenuBar", "com.canonical.dbusmenu", "Event", "(isvu)", items["Like"], "clicked",
+             GLib.Variant("s", ""), 0)
+        call("/MenuBar", "com.canonical.dbusmenu", "Event", "(isvu)", items["Next Wallpaper"], "clicked",
+             GLib.Variant("s", ""), 0)
+        deadline = time.monotonic() + 10
+        while self.current_id() != "clouds" and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if self.current_id() != "clouds":
+            tray.kill()
+            self.fail("Next Wallpaper did not rotate:\n" + tray.communicate()[0])
+        with self.database() as db:
+            self.assertTrue(db.get_feedback("harbor").get("like"))
+        call("/MenuBar", "com.canonical.dbusmenu", "AboutToShow", "(i)", 0)  # Opening the menu reads it again.
+        self.assertIn("Study of Clouds", menu())
+        self.assertIn("Study of Clouds", tooltip())
+        call("/MenuBar", "com.canonical.dbusmenu", "Event", "(isvu)", menu()["Quit Tray"], "clicked",
+             GLib.Variant("s", ""), 0)
+        self.assertEqual(tray.wait(timeout=5), 0)
+
+    def current_id(self) -> str:
+        with self.database() as db:
+            return db.get_current().id
+
     def test_native_app_opens_each_page_and_dialog(self):
         """Start the GTK app under headless Sway; with ARTWALL_SCREENSHOTS set, save each view."""
         self.config = "[display]\nwidth = 1920\nheight = 1080\n[llm]\nenabled = false\n"

@@ -141,3 +141,46 @@ def restart_rotation(runner: Callable[..., Any] = subprocess.run) -> None:
         runner(["systemctl", "--user", "try-restart", "artwall-rotate.timer"], capture_output=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         pass
+
+
+TRAY_UNIT = "artwall-tray.service"
+
+
+def tray_unit(executable: str) -> str:
+    if not executable.startswith("/") or any(ch in executable for ch in " \n\r\x00"):
+        raise ValueError("Systemd needs an absolute artwall executable path without spaces")
+    # KillMode=process: the app windows the tray opens outlive a tray restart.
+    return f"""[Unit]
+Description=Artwall in the system tray
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart={executable} tray
+Restart=on-failure
+RestartSec=5s
+KillMode=process
+
+[Install]
+WantedBy=graphical-session.target
+"""
+
+
+def set_tray(enabled: bool, executable: str, *, directory: Path | None = None,
+             runner: Callable[..., Any] = subprocess.run) -> None:
+    """Start the tray icon now and at every login, or stop and remove it."""
+    path = (directory or user_unit_dir()) / TRAY_UNIT
+    if enabled:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(tray_unit(executable), encoding="utf-8")
+        runner(["systemctl", "--user", "daemon-reload"], check=True)
+        runner(["systemctl", "--user", "enable", "--now", TRAY_UNIT], check=True)
+        runner(["systemctl", "--user", "restart", TRAY_UNIT], check=True)  # Picks up a new executable.
+    elif path.is_file():
+        runner(["systemctl", "--user", "disable", "--now", TRAY_UNIT], check=True)
+        path.unlink()
+        runner(["systemctl", "--user", "daemon-reload"], check=True)
+
+
+def tray_enabled(directory: Path | None = None) -> bool:
+    return ((directory or user_unit_dir()) / TRAY_UNIT).is_file()

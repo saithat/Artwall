@@ -57,7 +57,8 @@ class ArtwallApplication(Adw.Application):  # type: ignore[misc]
         Gtk.Window.set_default_icon_name(APP_ID)
         for name, callback, accels in (("quit", lambda *_: self.quit(), ["<Control>q"]),
                                        ("about", lambda *_: self._about(), []),
-                                       ("explain", lambda *_: self.explain(), ["<Control>e"])):
+                                       ("explain", lambda *_: self.explain(), ["<Control>e"]),
+                                       ("refresh", lambda *_: self._refresh_windows(), [])):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", callback)
             self.add_action(action)
@@ -77,6 +78,12 @@ class ArtwallApplication(Adw.Application):  # type: ignore[misc]
         else:
             self.activate()
         return 0
+
+    def _refresh_windows(self) -> None:
+        """Show changes made elsewhere, such as from the tray."""
+        for window in self.get_windows():
+            if isinstance(window, ArtwallWindow):
+                window.reload()
 
     def explain(self) -> None:
         """Show the current wallpaper full screen with the curator's notes."""
