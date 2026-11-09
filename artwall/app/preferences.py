@@ -29,6 +29,17 @@ def split_interval(minutes: int) -> tuple[int, int]:
     return minutes, 0
 
 
+def _time_spin(highest: int, step: int, value: int, name: str) -> Any:
+    """A two-digit hour or minute field."""
+    spin = Gtk.SpinButton.new_with_range(0, highest, step)
+    spin.set_value(value)
+    spin.set_wrap(True)
+    spin.set_orientation(Gtk.Orientation.VERTICAL)
+    spin.update_property([Gtk.AccessibleProperty.LABEL], [name])
+    spin.connect("output", lambda button: button.set_text(f"{int(button.get_value()):02d}") or True)
+    return spin
+
+
 _PROVIDERS = (("ollama", "Ollama (local)"), ("openai", "OpenAI-Compatible API"), ("agent", "Agent CLI (subscription)"))
 _AGENTS = (("claude", "Claude Code"), ("codex", "Codex"), ("command", "Custom command (config.toml)"))
 _MATCHES = 6
@@ -71,15 +82,30 @@ class Preferences(Adw.PreferencesDialog):  # type: ignore[misc]
         self._set_interval_range(amount)
         self.unit.connect("notify::selected", lambda *_: self._unit_changed())
         self.unit_shown = unit
-        every = Adw.ActionRow(title="Change Wallpaper Every",
-                              subtitle="From 15 minutes to 7 days. Give each work enough time to be seen.")
-        every.add_suffix(self.interval)
-        every.add_suffix(self.unit)
+        self.every = Adw.ActionRow(title="Every",
+                                   subtitle="Counted from the last change, from 15 minutes to 7 days.")
+        self.every.add_suffix(self.interval)
+        self.every.add_suffix(self.unit)
+        self.schedule = Adw.ComboRow(title="Change Wallpaper",
+                                     model=Gtk.StringList.new(["At an interval", "Every day at a set time"]))
+        self.schedule.set_selected(1 if settings.rotate_at else 0)
+        hour, minute = (int(part) for part in (settings.rotate_at or "07:00").split(":"))
+        self.hour = _time_spin(23, 1, hour, "Hour")
+        self.minute = _time_spin(59, 5, minute, "Minute")
+        clock = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER)
+        clock.append(self.hour)
+        clock.append(Gtk.Label(label=":", css_classes=["heading"]))
+        clock.append(self.minute)
+        self.at = Adw.ActionRow(title="At", subtitle="Local time, 24-hour. Missed while logged out, it changes at login.")
+        self.at.add_suffix(clock)
+        self.schedule.connect("notify::selected", lambda *_: self._show_schedule_rows())
+        self._show_schedule_rows()
         self.count = Adw.ComboRow(title="Works on One Wallpaper",
                                   subtitle="Related works can share the wall when they fit together well.",
                                   model=Gtk.StringList.new(["One", "Up to two", "Up to three"]))
         self.count.set_selected(settings.max_artworks - 1)
-        rotation.add(every)
+        for row in (self.schedule, self.every, self.at):
+            rotation.add(row)
         rotation.add(self.count)
         tray = Adw.SwitchRow(title="Show in System Tray", active=self.window.gallery.tray_enabled(),
                              subtitle="The current work and quick actions, from login on.")
@@ -131,6 +157,16 @@ class Preferences(Adw.PreferencesDialog):  # type: ignore[misc]
         minutes = self.interval.get_value() * _UNITS[self.unit_shown][1]
         self.unit_shown = self.unit.get_selected()
         self._set_interval_range(max(1, round(minutes / _UNITS[self.unit_shown][1])))
+
+    def _show_schedule_rows(self) -> None:
+        daily = self.schedule.get_selected() == 1
+        self.every.set_visible(not daily)
+        self.at.set_visible(daily)
+
+    def _rotate_at(self) -> str:
+        if self.schedule.get_selected() != 1:
+            return ""
+        return f"{int(self.hour.get_value()):02d}:{int(self.minute.get_value()):02d}"
 
     def _interval_minutes(self) -> int:
         return int(self.interval.get_value()) * _UNITS[self.unit.get_selected()][1]
@@ -206,7 +242,7 @@ class Preferences(Adw.PreferencesDialog):  # type: ignore[misc]
         self.model.set_title("Model" if provider == "agent" else "Vision Model")
 
     def _values(self) -> dict[str, Any]:
-        return {"interval_minutes": self._interval_minutes(), "max_artworks": self.count.get_selected() + 1,
+        return {"interval_minutes": self._interval_minutes(), "rotate_at": self._rotate_at(), "max_artworks": self.count.get_selected() + 1,
                 "model": self._selected_model(), **self._model_settings()}
 
     def _save(self) -> None:

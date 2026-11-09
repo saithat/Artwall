@@ -161,6 +161,19 @@ class GalleryTests(HomeTest):
         # Commands see the saved values too, over config.toml.
         self.assertIn(f"interval_minutes = {interval}", self.cli("status"))
 
+    def test_a_daily_time_replaces_the_interval_on_the_timer(self):
+        self.cli("install-timers", "--no-enable")
+        timer = user_unit_dir() / "artwall-rotate.timer"
+        for bad in ("24:00", "7:30", "07:60", "noon"):
+            with self.assertRaises(ValueError):
+                self.gallery.save_settings(interval_minutes=120, model="local", max_artworks=1, rotate_at=bad)
+        self.gallery.save_settings(interval_minutes=120, model="local", max_artworks=1, rotate_at="06:45")
+        self.assertEqual(self.gallery.settings().rotate_at, "06:45")
+        self.assertIn("OnCalendar=*-*-* 06:45:00", timer.read_text())
+        self.gallery.save_settings(interval_minutes=120, model="local", max_artworks=1, rotate_at="")
+        self.assertIn("OnUnitActiveSec=120min", timer.read_text())
+        self.assertNotIn("OnCalendar", timer.read_text())
+
     def test_artwork_and_artist_exclusions_filter_independently(self):
         with self.database() as db:
             self.queue(db, "same-artist", self.artwork("11", artist="A Painter"))

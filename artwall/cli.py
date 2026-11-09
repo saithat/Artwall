@@ -284,7 +284,7 @@ def cmd_next(args: argparse.Namespace, settings: Settings) -> None:
         if composition:
             _announce(db, composition, applied=not args.no_apply)
         else:
-            print("Rotation interval has not elapsed; wallpaper unchanged.")
+            print("No scheduled change is due; wallpaper unchanged.")
 
 
 def cmd_previous(args: argparse.Namespace, settings: Settings) -> None:

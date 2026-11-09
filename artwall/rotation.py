@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from datetime import datetime, timedelta
 import json
 import logging
 from pathlib import Path
@@ -185,12 +186,26 @@ def advance(db: Database, settings: Settings, *, apply: bool = True) -> Composit
     return composition
 
 
+def last_scheduled(at: str, now: float) -> float:
+    """The latest daily HH:MM time at or before ``now`` (Unix time), in local time."""
+    hour, minute = (int(part) for part in at.split(":"))
+    moment = datetime.fromtimestamp(now).replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if moment.timestamp() > now:
+        moment -= timedelta(days=1)
+    return moment.timestamp()
+
+
 def advance_if_due(db: Database, settings: Settings, *, apply: bool = True) -> Composition | None:
-    """At login, advance once only after a full interval since the last successful show."""
+    """At login, advance once when a change was missed: a full interval, or a daily time, since the last show."""
     current = db.get_current()
-    if (current and current.shown_at is not None
-            and time.time() - current.shown_at <= settings.interval_minutes * 60):
-        return None
+    if current and current.shown_at is not None:
+        now = time.time()
+        if settings.rotate_at:
+            due = current.shown_at < last_scheduled(settings.rotate_at, now)
+        else:
+            due = now - current.shown_at > settings.interval_minutes * 60
+        if not due:
+            return None
     return advance(db, settings, apply=apply)
 
 

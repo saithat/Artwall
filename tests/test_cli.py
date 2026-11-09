@@ -1,5 +1,6 @@
 """End-to-end command scenarios in a temporary home with fake desktop commands."""
 
+from datetime import datetime
 import json
 from io import BytesIO
 from pathlib import Path
@@ -437,6 +438,27 @@ class CliTests(HomeTest):
             self.assertEqual([item.id for item in db.list_compositions(only_unshown=True)], ["third"])
         self.cli("next", "--no-apply")
         self.assertEqual(self.current_id(), "third")
+
+    def test_daily_rotation_changes_at_its_time_and_catches_up_once_at_login(self):
+        self.configure('[rotation]\nat = "07:30"\n')
+        with self.database() as db:
+            for identifier in ("first", "second", "third"):
+                self.queue(db, identifier, self.artwork(identifier, title=identifier.title()))
+        self.cli("install-timers", "--no-enable")
+        timer = (self.root / "config" / "systemd" / "user" / "artwall-rotate.timer").read_text()
+        self.assertIn("OnCalendar=*-*-* 07:30:00", timer)
+        self.assertNotIn("OnUnitActiveSec", timer)
+        self.assertNotIn("Persistent", timer)  # The login service makes the one catch-up change.
+
+        shown = datetime(2026, 3, 10, 8, 0).timestamp()  # Shown after that day's 07:30.
+        with patch("artwall.rotation.time.time", return_value=shown):
+            self.cli("next")
+        for moment, expected in ((datetime(2026, 3, 11, 7, 29), "first"),  # Before the next 07:30.
+                                 (datetime(2026, 3, 13, 9, 0), "second"),  # Logged out over two 07:30s: one change.
+                                 (datetime(2026, 3, 13, 9, 5), "second")):
+            with patch("artwall.rotation.time.time", return_value=moment.timestamp()):
+                self.cli("next", "--if-due")
+            self.assertEqual(self.current_id(), expected)
 
     def test_tray_starts_at_login_until_removed(self):
         self.cli("install-tray")

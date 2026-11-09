@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 import json
+import re
 import math
 import os
 from pathlib import Path
@@ -56,6 +57,13 @@ def write_atomic(path: Path, text: str) -> None:
 
 
 MIN_INTERVAL_MINUTES = 15
+_TIME = re.compile(r"([01][0-9]|2[0-3]):[0-5][0-9]")
+
+
+def valid_time(text: str) -> bool:
+    """Empty, or a 24-hour HH:MM time."""
+    return not text or _TIME.fullmatch(text) is not None
+
 MAX_INTERVAL_MINUTES = 7 * 24 * 60
 
 @dataclass(frozen=True)
@@ -63,6 +71,7 @@ class Settings:
     width: int = 1920
     height: int = 1080
     interval_minutes: int = 120
+    rotate_at: str = ""  # "HH:MM": change once a day at this local time instead of every interval.
     wallpaper_backend: str = "auto"
     wallpaper_output: str | None = None
     lockscreen_backend: str = "auto"
@@ -98,6 +107,7 @@ class Settings:
             (self.width >= 320 and self.height >= 240, "Display size must be at least 320 × 240"),
             (MIN_INTERVAL_MINUTES <= self.interval_minutes <= MAX_INTERVAL_MINUTES,
              "Rotation interval must be between 15 minutes and 7 days"),
+            (valid_time(self.rotate_at), 'rotation.at must be a 24-hour time such as "07:30", or empty'),
             (1 <= self.max_artworks <= 3, "max_artworks must be from 1 to 3"),
             (1 <= self.queue_size <= 30, "queue_size must be from 1 to 30"),
             (1 <= self.candidate_pool_size <= 100, "candidate_pool_size must be from 1 to 100"),
@@ -123,6 +133,7 @@ _OPTIONS: dict[str, tuple[str, str, type]] = {
     "width": ("display", "width", int),
     "height": ("display", "height", int),
     "interval_minutes": ("rotation", "interval_minutes", int),
+    "rotate_at": ("rotation", "at", str),
     "wallpaper_backend": ("wallpaper", "backend", str),
     "wallpaper_output": ("wallpaper", "output", str),
     "lockscreen_backend": ("lockscreen", "backend", str),
@@ -201,7 +212,7 @@ def curation_fingerprint(settings: Settings) -> str:
 # Settings the gallery edits. They are saved in the database and take
 # precedence over config.toml, which artwall never rewrites.
 GALLERY_SETTINGS: dict[str, type] = {
-    "interval_minutes": int, "model": str, "max_artworks": int, "model_provider": str, "model_url": str,
+    "interval_minutes": int, "rotate_at": str, "model": str, "max_artworks": int, "model_provider": str, "model_url": str,
     "agent": str, "api_key_env": str, "api_key_file": str,
 }
 

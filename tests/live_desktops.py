@@ -205,7 +205,7 @@ class LiveDesktopTests(HomeTest):
 
     def test_native_app_opens_each_page_and_dialog(self):
         """Start the GTK app under headless Sway; with ARTWALL_SCREENSHOTS set, save each view."""
-        self.config = "[display]\nwidth = 1920\nheight = 1080\n[llm]\nenabled = false\n"
+        self.config = "[display]\nwidth = 1920\nheight = 1080\n[rotation]\nat = \"07:30\"\n[llm]\nenabled = false\n"
         self.configure()
         with self.database() as db:
             for index, (size, title) in enumerate((((1800, 1200), "Harbor at Dusk"), ((1200, 1500), "Study of Clouds"),

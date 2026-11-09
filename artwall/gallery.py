@@ -27,7 +27,7 @@ from PIL import Image, ImageOps
 
 from artwall import rotation
 from artwall.config import (
-    MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES, Settings, config_path, curation_fingerprint, data_dir, database_path, load_config, model_api_key,
+    MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES, Settings, config_path, valid_time, curation_fingerprint, data_dir, database_path, load_config, model_api_key,
 )
 from artwall.models import Artwork, Composition, Note
 from artwall.prompts import EDITABLE, PromptPart, resolve, validate_overrides
@@ -231,7 +231,8 @@ class Gallery:
             raise ValueError(f"Could not change the tray service: {exc}") from exc
         return "Artwall is in the system tray." if enabled else "Artwall left the system tray."
 
-    def save_settings(self, *, interval_minutes: int, model: str, max_artworks: int, **model_settings: str) -> str:
+    def save_settings(self, *, interval_minutes: int, model: str, max_artworks: int, rotate_at: str | None = None,
+                      **model_settings: str) -> str:
         """Validate and save the app's settings, updating the rotation timer and the upcoming queue.
 
         ``model_settings`` may set model_provider, model_url, agent, api_key_env, and api_key_file.
@@ -250,10 +251,13 @@ class Gallery:
             raise ValueError("Enter a valid model name")
         if not MIN_INTERVAL_MINUTES <= interval_minutes <= MAX_INTERVAL_MINUTES:
             raise ValueError("Rotation interval must be between 15 minutes and 7 days")
+        if rotate_at is not None and not valid_time(rotate_at.strip()):
+            raise ValueError("Enter a daily time such as 07:30")
         variable = model_settings.get("api_key_env")
         if variable is not None and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,100}", variable):
             raise ValueError("Enter an environment variable name such as OPENAI_API_KEY")
         values = {"interval_minutes": interval_minutes, "max_artworks": max_artworks, "model": model,
+                  **({"rotate_at": rotate_at.strip()} if rotate_at is not None else {}),
                   **{key: value.strip() for key, value in model_settings.items()}}
         with self._database() as db:
             settings = db.save_gallery_settings(configured, values)
@@ -279,11 +283,11 @@ class Gallery:
 
     def _apply(self, notice: str, old: Settings, settings: Settings) -> str:
         """Follow a settings change through: the rotation timer, then the upcoming queue."""
-        if settings.interval_minutes != old.interval_minutes:
+        if (settings.interval_minutes, settings.rotate_at) != (old.interval_minutes, old.rotate_at):
             executable = shutil.which("artwall")
             if not executable or not update_rotate_timer(settings, str(Path(executable).resolve()),
                                                          directory=self.unit_dir):
-                notice += " Run artwall install-timers to apply the new rotation interval."
+                notice += " Run artwall install-timers to apply the new rotation schedule."
         if curation_fingerprint(settings) != curation_fingerprint(old):
             # Upcoming wallpapers follow the new settings; old ones stay until replaced.
             self.start_preparation(None)

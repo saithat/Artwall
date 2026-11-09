@@ -45,13 +45,12 @@ Type=oneshot
 ExecStart={executable} next
 """,
         "artwall-rotate.timer": f"""[Unit]
-Description=Rotate museum wallpaper every {settings.interval_minutes} minutes
+Description=Rotate museum wallpaper {_schedule(settings)[0]}
 PartOf=graphical-session.target
 After=graphical-session.target
 
 [Timer]
-OnActiveSec={settings.interval_minutes}min
-OnUnitActiveSec={settings.interval_minutes}min
+{_schedule(settings)[1]}
 Unit=artwall-rotate.service
 
 [Install]
@@ -80,6 +79,18 @@ Unit=artwall-curate.service
 WantedBy=timers.target
 """,
     }
+
+
+def _schedule(settings: Settings) -> tuple[str, str]:
+    """The timer's description and trigger lines: a daily time, or an interval.
+
+    A daily timer is not Persistent: at login, artwall-login.service makes the
+    one catch-up change, so a missed time does not change the wallpaper twice.
+    """
+    if settings.rotate_at:
+        return f"every day at {settings.rotate_at}", f"OnCalendar=*-*-* {settings.rotate_at}:00\nAccuracySec=1min"
+    minutes = settings.interval_minutes
+    return f"every {minutes} minutes", f"OnActiveSec={minutes}min\nOnUnitActiveSec={minutes}min"
 
 
 def write_units(settings: Settings, directory: Path, executable: str) -> list[Path]:
