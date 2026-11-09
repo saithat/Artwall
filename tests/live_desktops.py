@@ -14,12 +14,22 @@ import sys
 import time
 from unittest.mock import patch
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
 from artwall.desktop import lock_screen_backend
 from tests.support import HomeTest
 
 _REAL_PATH = os.environ.get("PATH", "/usr/bin:/bin")
+
+
+def _sun_height(screenshot: Path) -> int:
+    """How tall the test wallpaper's sun appears in a screenshot, in pixels."""
+    with Image.open(screenshot) as shot:
+        bands = shot.convert("RGB").split()
+    masks = [band.point(lambda v, want=want: 255 if abs(v - want) <= 8 else 0)
+             for band, want in zip(bands, (235, 205, 135))]
+    box = ImageChops.multiply(ImageChops.multiply(masks[0], masks[1]), masks[2]).getbbox()
+    return 0 if box is None else box[3] - box[1]
 
 
 def _read(*command: str) -> str:
@@ -147,11 +157,18 @@ class LiveDesktopTests(HomeTest):
                  "box": {"x": 0.2, "y": 0.68, "width": 0.6, "height": 0.28},
                  "source": "A pale sun hangs over dark water while two small boats rest near the far bank and "
                            "clouds drift across a wide sky."}]
+            payload["notes"] += [  # As many notes as a curator writes, so the page is taller than the window.
+                {"artwork_id": current.artwork_ids[0], "title": f"Detail {number}",
+                 "body": "A further passage worth a slower look, described at the length a curator's note "
+                         "usually takes, which is two or three full sentences on the page.",
+                 "box": {"x": 0.1 * number, "y": 0.4, "width": 0.1, "height": 0.1}, "source": ""}
+                for number in (3, 4, 5)]
             # A conversation with long unbroken tokens, as real prompts and answers have.
             token = "https://www.artic.edu/iiif/2/" + "a1b2c3d4" * 40 + "/full/843,/0/default.jpg"
             payload.setdefault("render", {})["transcript"] = [
-                {"purpose": "Choosing the art", "prompt": "Candidates: " + token + " " + "word " * 3000,
-                 "answer": '{"layout":"single","artworks":[{"id":"' + "x" * 300 + '"}]}'}]
+                {"purpose": purpose, "prompt": "Candidates: " + token + " " + "word " * 3000,
+                 "answer": '{"layout":"single","artworks":[{"id":"' + "x" * 300 + '"}]}'}
+                for purpose in ("Choosing the art", "Describing the final layout", "Writing teaching notes")]
             db.connection.execute("UPDATE compositions SET payload = ? WHERE id = ?",
                                   (json.dumps(payload), current.id))
             db.connection.commit()
@@ -182,6 +199,11 @@ class LiveDesktopTests(HomeTest):
             self.assertIsNone(app.poll(), "The app exited while switching views")
             if shots:
                 subprocess.run(["grim", f"{shots}/{name}.png"], check=True, env=environment)
+            if name == "now":  # The preview keeps its size however long the page below it is.
+                shot = Path(shots or self.root) / "now.png"
+                if not shots:
+                    subprocess.run(["grim", str(shot)], check=True, env=environment)
+                self.assertGreater(_sun_height(shot), 100, "The wallpaper preview is missing or squeezed")
         # The explain overlay: full screen, then pointing at the first note's marker.
         subprocess.run(["gdbus", "call", "--session", "--dest", "io.github.saithat.Artwall", "--object-path",
                         "/io/github/saithat/Artwall", "--method", "org.gtk.Actions.Activate", "explain", "[]", "{}"],

@@ -17,7 +17,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 from artwall.app.details import details, when  # noqa: E402
 from artwall.app.explain import CSS as EXPLAIN_CSS, open_explain  # noqa: E402
 from artwall.app.preferences import Preferences  # noqa: E402
-from artwall.app.widgets import Background, label, picture, vbox  # noqa: E402
+from artwall.app.widgets import Background, label, picture, scroll_to, vbox  # noqa: E402
 from artwall.gallery import WHY_SLOW, Gallery, Record, State  # noqa: E402
 from artwall.launcher import APP_ID, DATA  # noqa: E402
 from artwall.rotation import Vote  # noqa: E402
@@ -143,7 +143,6 @@ class ArtwallWindow(Adw.ApplicationWindow):  # type: ignore[misc]
         self.set_content(self.toasts)
 
         self.now = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-        self.coming = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         self.seen = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         self.stack.add_titled_with_icon(self.now, "now", "On Your Wall", "image-x-generic-symbolic")
         self.coming_page = self.stack.add_titled_with_icon(self._coming_shell(), "next", "Coming Next",
@@ -299,12 +298,12 @@ class ArtwallWindow(Adw.ApplicationWindow):  # type: ignore[misc]
         self.state = state
         if self.gallery.preparation().status == "running":
             self._watch_preparation()  # For example after settings changed upcoming wallpapers.
-        self.now.set_child(self._now_page(state))
-        self.coming_grid.set_child(self._grid(
+        scroll_to(self.now, self._now_page(state))
+        scroll_to(self.coming_grid, self._grid(
             state.queued, "Nothing Prepared Yet", "Regenerate to prepare the queue now, or wait for the hourly "
             "curation.", "view-grid-symbolic"))
         self.coming_page.set_badge_number(len(state.queued))
-        self.seen.set_child(self._grid(state.history, "Nothing Seen Yet", "Works you have lived with appear here.",
+        scroll_to(self.seen, self._grid(state.history, "Nothing Seen Yet", "Works you have lived with appear here.",
                                        "document-open-recent-symbolic"))
         if self.dialog is not None and self.dialog_record is not None:
             record = state.find(self.dialog_record)
@@ -405,7 +404,7 @@ class ArtwallWindow(Adw.ApplicationWindow):  # type: ignore[misc]
         box.append(label(when(record), "caption-heading", "accent"))
         box.append(picture(self.background, lambda: record.image_path, record.title, "artwork"))
         box.append(details(self, record, self.state))
-        self.dialog_scroll.set_child(Adw.Clamp(maximum_size=900, child=box))
+        scroll_to(self.dialog_scroll, Adw.Clamp(maximum_size=900, child=box))
 
     def show_preferences(self) -> None:
         if self.state is None:

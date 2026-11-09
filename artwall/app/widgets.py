@@ -60,6 +60,15 @@ def label(text: str, *classes: str, wrap: bool = True, selectable: bool = False,
     return widget
 
 
+def scroll_to(scroller: Any, child: Any) -> None:
+    """Show a page in a scrolled window at its natural height.
+
+    GTK's default viewport allocates a page's minimum height, and a picture that can
+    shrink has none, so the wallpaper preview only got whatever the text left over.
+    """
+    scroller.set_child(Gtk.Viewport(child=child, vscroll_policy=Gtk.ScrollablePolicy.NATURAL))
+
+
 def text_view(text: str, *classes: str, max_height: int = 360) -> Any:
     """Long read-only text in its own scrolling box, so it neither widens nor floods the page."""
     view = Gtk.TextView(editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.WORD_CHAR, top_margin=10,
